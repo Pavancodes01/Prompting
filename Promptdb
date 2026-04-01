@@ -1,0 +1,260 @@
+---
+name: mongodb-query-gen
+description: >
+  Generate raw MongoDB queries (mongosh syntax) by reading a Java model class.
+  Use this skill whenever the user shares a Java @Document class, POJO, or 
+  entity and wants MongoDB queries — including find, findOne, aggregate, 
+  update, updateMany, deleteOne, deleteMany, insertOne, insertMany, countDocuments,
+  distinct, and index creation. Trigger on phrases like: "generate mongo query 
+  for this model", "write a mongodb query for this class", "give me mongosh query",
+  "query for this Java model", "mongodb find/update/delete/aggregate for my class",
+  "write raw mongo queries". Also trigger when the user pastes a Java class and 
+  asks anything about fetching, filtering, sorting, grouping, or modifying data
+  and wants the output as plain MongoDB shell queries, NOT Java code.
+---
+
+# MongoDB Raw Query Generation Skill (mongosh)
+
+You generate raw MongoDB shell queries (mongosh syntax) from Java model classes.
+Never output Java code. All output must be runnable directly in the terminal.
+
+## Step 1 — Read the Java Model
+
+Extract the following from the Java class:
+
+- Collection name → @Document(collection="...") → e.g. orders
+- Field names → @Field("mongo_name") if present, else use Java field name
+- Field types → Java type declarations like String, Double, List, LocalDate
+- ID field → @Id annotation → maps to _id in MongoDB
+- Nested objects → Inner class or embedded POJO → use dot notation e.g. address.city
+
+If no @Field annotation exists, use the Java field name as-is.
+If @Id is on a field, that field maps to _id in MongoDB.
+
+## Step 2 — Map Java Types to MongoDB Types
+
+String → "value"
+int / Integer / long / Double → 123 / 99.9 (no quotes)
+boolean / Boolean → true / false
+LocalDate / LocalDateTime / Date → ISODate("2024-01-15T00:00:00Z")
+List<T> / Set<T> → use $in or $all for queries
+ObjectId / @Id String → ObjectId("64f1a2b3c4d5e6f7a8b9c0d1")
+Enum → "ENUM_VALUE" (stored as string by default)
+Nested class → dot notation e.g. "address.city"
+
+## Step 3 — Generate Queries
+
+Always format every query like:
+// What this query does (one line)
+db.<collection>.method({ ... })
+
+--- FIND ---
+
+// Find all
+db.orders.find({})
+
+// Find with filter
+db.orders.find({ status: "COMPLETED" })
+
+// Find one
+db.orders.findOne({ _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") })
+
+// AND condition
+db.orders.find({ status: "COMPLETED", userId: "u123" })
+
+// OR condition
+db.orders.find({ $or: [{ status: "PENDING" }, { status: "FAILED" }] })
+
+// Range query
+db.orders.find({ amount: { $gte: 100, $lte: 500 } })
+
+// Date range
+db.orders.find({ createdAt: { $gte: ISODate("2024-01-01T00:00:00Z"), $lte: ISODate("2024-12-31T23:59:59Z") } })
+
+// Nested field
+db.orders.find({ "address.city": "Chennai" })
+
+// Field exists
+db.orders.find({ couponCode: { $exists: true } })
+
+// Array contains value
+db.orders.find({ tags: { $in: ["express", "priority"] } })
+
+// Projection (specific fields only)
+db.orders.find({ status: "COMPLETED" }, { userId: 1, amount: 1, _id: 0 })
+
+// Sort + limit + skip (pagination)
+db.orders.find({ status: "COMPLETED" }).sort({ createdAt: -1 }).limit(10).skip(20)
+
+// Count documents
+db.orders.countDocuments({ status: "PENDING" })
+
+// Distinct values
+db.orders.distinct("status")
+
+--- UPDATE ---
+
+// Update one field
+db.orders.updateOne(
+  { _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") },
+  { $set: { status: "COMPLETED" } }
+)
+
+// Update many documents
+db.orders.updateMany(
+  { status: "PENDING" },
+  { $set: { status: "CANCELLED" } }
+)
+
+// Update multiple fields
+db.orders.updateOne(
+  { _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") },
+  { $set: { status: "SHIPPED", updatedAt: ISODate("2024-06-01T00:00:00Z") } }
+)
+
+// Increment a number
+db.orders.updateOne(
+  { _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") },
+  { $inc: { amount: 50 } }
+)
+
+// Push into array
+db.orders.updateOne(
+  { _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") },
+  { $push: { tags: "urgent" } }
+)
+
+// Pull from array
+db.orders.updateOne(
+  { _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") },
+  { $pull: { tags: "express" } }
+)
+
+// Upsert
+db.orders.updateOne(
+  { orderId: "ORD-9999" },
+  { $set: { status: "PENDING", amount: 200 } },
+  { upsert: true }
+)
+
+--- DELETE ---
+
+// Delete one
+db.orders.deleteOne({ _id: ObjectId("64f1a2b3c4d5e6f7a8b9c0d1") })
+
+// Delete many
+db.orders.deleteMany({ status: "CANCELLED" })
+
+// Delete old records
+db.orders.deleteMany({ createdAt: { $lt: ISODate("2023-01-01T00:00:00Z") } })
+
+--- INSERT ---
+
+// Insert one
+db.orders.insertOne({
+  userId: "u123",
+  status: "PENDING",
+  amount: 299.99,
+  createdAt: ISODate("2024-06-01T00:00:00Z"),
+  tags: ["express"]
+})
+
+// Insert many
+db.orders.insertMany([
+  { userId: "u123", status: "PENDING", amount: 100 },
+  { userId: "u456", status: "COMPLETED", amount: 250 }
+])
+
+--- AGGREGATE ---
+
+// Group by field and count
+db.orders.aggregate([
+  { $group: { _id: "$status", count: { $sum: 1 } } }
+])
+
+// Total revenue per user
+db.orders.aggregate([
+  { $match: { status: "COMPLETED" } },
+  { $group: { _id: "$userId", totalRevenue: { $sum: "$amount" } } },
+  { $sort: { totalRevenue: -1 } }
+])
+
+// Average value per group
+db.orders.aggregate([
+  { $group: { _id: "$userId", avgAmount: { $avg: "$amount" } } }
+])
+
+// Join with another collection
+db.orders.aggregate([
+  {
+    $lookup: {
+      from: "users",
+      localField: "userId",
+      foreignField: "_id",
+      as: "userDetails"
+    }
+  },
+  { $unwind: "$userDetails" },
+  { $project: { amount: 1, status: 1, "userDetails.name": 1 } }
+])
+
+// Full pipeline: filter → group → sort → limit
+db.orders.aggregate([
+  { $match: { createdAt: { $gte: ISODate("2024-01-01T00:00:00Z") } } },
+  { $group: { _id: "$userId", totalOrders: { $sum: 1 }, totalAmount: { $sum: "$amount" } } },
+  { $sort: { totalAmount: -1 } },
+  { $limit: 10 }
+])
+
+--- INDEXES ---
+
+// Single field
+db.orders.createIndex({ status: 1 })
+
+// Compound index
+db.orders.createIndex({ userId: 1, status: 1 })
+
+// Descending (for sort by date)
+db.orders.createIndex({ createdAt: -1 })
+
+// Unique index
+db.orders.createIndex({ orderId: 1 }, { unique: true })
+
+// TTL — auto-delete after 30 days
+db.orders.createIndex({ createdAt: 1 }, { expireAfterSeconds: 2592000 })
+
+// View all indexes
+db.orders.getIndexes()
+
+## Step 4 — Index Recommendation Rule
+
+After every find/match/sort query, check:
+- Filtering on a field? → recommend index on it
+- Sorting on a field? → include in index
+- Filtering on two fields? → recommend compound index
+
+Format:
+⚠️ Recommended index: db.orders.createIndex({ userId: 1, status: 1, createdAt: -1 })
+
+## Step 5 — Output Format Per Request
+
+1. The query (copy-paste ready for mongosh)
+2. One-line comment explaining what it does
+3. Index recommendation if needed
+4. Alternate variant if relevant
+
+## Roo Code Configuration
+
+Create this file in your project root:
+.roo/rules-mongodb-query-gen.md
+
+Content:
+When I paste a Java class and ask for MongoDB queries:
+- Read @Document(collection=...) for collection name
+- Read @Field("...") for MongoDB field names; fallback to Java field name
+- @Id maps to _id in MongoDB
+- Generate raw mongosh queries ONLY — no Java code
+- Cover find, update, delete, aggregate, insert unless I ask for something specific
+- Recommend indexes for filter/sort fields
+- Use ISODate() for LocalDate or LocalDateTime fields
+- Output must be copy-pasteable into mongosh terminal
