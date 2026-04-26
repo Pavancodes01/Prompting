@@ -1,0 +1,548 @@
+"""
+POM Selector MCP Server
+=======================
+FastMCP server that visits a URL via Playwright headless browser,
+scans the DOM, and returns selectors ranked by quality — ready to
+paste into a Java Playwright Page Object Model (POM) class.
+
+Tools exposed:
+  - scan_page_selectors   → full selector scan + Java constants
+  - generate_java_pom     → full Java Page Object class from a URL
+  - scan_element          → deep-dive a single CSS selector
+"""
+
+import re
+import json
+from typing import Optional
+from urllib.parse import urlparse
+
+from fastmcp import FastMCP
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ── Server ──────────────────────────────────────────────────────────────────
+mcp = FastMCP(
+    name="pom-selector-mcp",
+    instructions=(
+        "Scans web pages using Playwright and returns high-quality CSS/ARIA "
+        "selectors ranked by stability, formatted for Java Playwright POM classes."
+    ),
+)
+
+# ── Constants ────────────────────────────────────────────────────────────────
+INTERACTIVE_TAGS = {"input", "button", "a", "select", "textarea", "form"}
+LANDMARK_TAGS    = {"h1", "h2", "h3", "nav", "header", "footer", "main", "section"}
+ALL_SCAN_TAGS    = INTERACTIVE_TAGS | LANDMARK_TAGS
+
+PAGE_TIMEOUT_MS  = 20_000   # 20s page load timeout
+SCAN_TIMEOUT_MS  = 10_000   # 10s for element operations
+
+# ── Chrome Path ───────────────────────────────────────────────────────────────
+# Set this to your locally installed Chrome/Chromium executable path.
+# Common paths:
+#   Linux   : "/usr/bin/google-chrome" or "/usr/bin/chromium-browser"
+#   macOS   : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+#   Windows : "C:/Program Files/Google/Chrome/Application/chrome.exe"
+
+CHROME_EXECUTABLE_PATH = ""
+
+# ── Selector Scoring ─────────────────────────────────────────────────────────
+
+def score_and_build(el: dict) -> dict:
+    """
+    Given an element attribute dict, return the best selector with its score.
+
+    Priority (matches playwright-pom skill conventions):
+      100  data-testid          → getByTestId
+       90  aria-label + role    → role-based
+       85  id (non-dynamic)     → #id
+       80  name attribute       → [name='x']
+       75  placeholder          → [placeholder='x']
+       70  type + tag combo     → input[type='submit']
+       50  stable class         → .class-name
+       20  fallback XPath text  → last resort
+    """
+    tag        = el.get("tag", "")
+    el_id      = el.get("id", "")
+    el_name    = el.get("name", "")
+    el_type    = el.get("type", "")
+    testid     = el.get("data-testid", "") or el.get("data-test", "") or el.get("data-cy", "")
+    aria_label = el.get("aria-label", "")
+    placeholder= el.get("placeholder", "")
+    classes    = el.get("classes", [])
+    text       = (el.get("text", "") or "").strip()[:50]
+    role       = el.get("role", "")
+
+    # 1️⃣ data-testid (most stable)
+    if testid:
+        return {"selector": f"[data-testid='{testid}']", "strategy": "testId", "score": 100}
+
+    # 2️⃣ ARIA role + accessible name
+    if aria_label and tag in ("button", "a", "input", "select", "textarea"):
+        aria_role = role or tag
+        return {"selector": f"[aria-label='{aria_label}']", "strategy": "aria-label", "score": 90}
+
+    # 3️⃣ Non-dynamic ID
+    if el_id and not _looks_dynamic(el_id):
+        return {"selector": f"#{el_id}", "strategy": "id", "score": 85}
+
+    # 4️⃣ name attribute (great for form fields)
+    if el_name and tag in ("input", "select", "textarea"):
+        return {"selector": f"{tag}[name='{el_name}']", "strategy": "name", "score": 80}
+
+    # 5️⃣ placeholder (inputs)
+    if placeholder and tag == "input":
+        return {"selector": f"input[placeholder='{placeholder}']", "strategy": "placeholder", "score": 75}
+
+    # 6️⃣ type-based (submit/reset buttons, specific input types)
+    if el_type in ("submit", "reset", "checkbox", "radio", "file", "email", "password", "search"):
+        return {"selector": f"{tag}[type='{el_type}']", "strategy": "type", "score": 70}
+
+    # 7️⃣ Stable CSS class (single, no dynamic-looking names)
+    stable_classes = [c for c in classes if not _looks_dynamic(c) and len(c) > 2]
+    if stable_classes:
+        css = f"{tag}.{stable_classes[0]}" if tag else f".{stable_classes[0]}"
+        return {"selector": css, "strategy": "class", "score": 50}
+
+    # 8️⃣ Text-based XPath fallback
+    if text and tag in ("button", "a", "h1", "h2", "h3"):
+        safe_text = text.replace("'", "\\'")
+        return {"selector": f"//{tag}[normalize-space()='{safe_text}']", "strategy": "xpath-text", "score": 20}
+
+    # 9️⃣ bare tag (last resort, unreliable)
+    return {"selector": tag or "*", "strategy": "bare-tag", "score": 5}
+
+
+def _looks_dynamic(value: str) -> bool:
+    """Heuristic: IDs/classes with long hex strings, numbers, or GUIDs are dynamic."""
+    if not value:
+        return False
+    # contains 6+ consecutive digits or hex patterns → likely dynamic
+    if re.search(r'[0-9a-f]{6,}', value.lower()):
+        return True
+    # more than 2 numbers in the value
+    if len(re.findall(r'\d', value)) > 3:
+        return True
+    return False
+
+
+def _to_java_constant_name(el: dict) -> str:
+    """
+    Convert element metadata to a UPPER_SNAKE_CASE Java constant name.
+    e.g.  input[type=password] + name=pwd  →  PASSWORD_INPUT
+    """
+    tag        = el.get("tag", "element")
+    el_id      = el.get("id", "")
+    el_name    = el.get("name", "")
+    aria_label = el.get("aria-label", "")
+    placeholder= el.get("placeholder", "")
+    el_type    = el.get("type", "")
+    text       = (el.get("text", "") or "").strip()[:30]
+    testid     = el.get("data-testid", "") or el.get("data-cy", "")
+
+    # pick the best human-readable name source
+    raw = testid or aria_label or el_id or el_name or placeholder or text or el_type or tag
+
+    # suffix by tag type
+    suffix_map = {
+        "input":    "INPUT",
+        "button":   "BUTTON",
+        "a":        "LINK",
+        "select":   "DROPDOWN",
+        "textarea": "TEXTAREA",
+        "form":     "FORM",
+        "h1": "HEADING", "h2": "HEADING", "h3": "HEADING",
+        "nav":    "NAV",
+        "header": "HEADER",
+        "footer": "FOOTER",
+    }
+    suffix = suffix_map.get(tag, "ELEMENT")
+
+    # clean to UPPER_SNAKE_CASE
+    name = re.sub(r'[^a-zA-Z0-9\s_]', ' ', raw)
+    name = re.sub(r'\s+', '_', name.strip()).upper()
+    name = re.sub(r'_+', '_', name).strip('_')
+
+    if not name:
+        name = tag.upper()
+
+    # avoid name == suffix duplication
+    if name == suffix:
+        return name
+    return f"{name}_{suffix}"
+
+
+# ── DOM Scanner ──────────────────────────────────────────────────────────────
+
+def _scan_dom(page, url: str) -> list[dict]:
+    """Navigate to URL and extract element metadata for all interactive/landmark tags."""
+    page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+
+    selector_query = ", ".join(ALL_SCAN_TAGS)
+
+    elements = page.evaluate(f"""
+    () => {{
+        const els = document.querySelectorAll('{selector_query}');
+        const results = [];
+        for (const el of els) {{
+            // Skip hidden elements
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+
+            const classes = Array.from(el.classList);
+            results.push({{
+                tag:           el.tagName.toLowerCase(),
+                id:            el.id || '',
+                name:          el.getAttribute('name') || '',
+                type:          el.getAttribute('type') || '',
+                placeholder:   el.getAttribute('placeholder') || '',
+                'aria-label':  el.getAttribute('aria-label') || '',
+                role:          el.getAttribute('role') || '',
+                'data-testid': el.getAttribute('data-testid') || el.getAttribute('data-test') || el.getAttribute('data-cy') || '',
+                classes:       classes,
+                text:          (el.innerText || el.value || '').trim().substring(0, 60),
+                href:          el.getAttribute('href') || '',
+                outerHTML:     el.outerHTML.substring(0, 200),
+            }});
+        }}
+        return results;
+    }}
+    """)
+
+    return elements
+
+
+def _deduplicate(selectors: list[dict]) -> list[dict]:
+    """Remove duplicate selectors, keeping highest score."""
+    seen = {}
+    for item in selectors:
+        sel = item["selector"]
+        if sel not in seen or item["score"] > seen[sel]["score"]:
+            seen[sel] = item
+    return list(seen.values())
+
+
+def _build_results(elements: list[dict]) -> list[dict]:
+    """Score every element and return sorted results."""
+    results = []
+    for el in elements:
+        scored = score_and_build(el)
+        constant_name = _to_java_constant_name(el)
+        results.append({
+            "constant_name": constant_name,
+            "selector":      scored["selector"],
+            "strategy":      scored["strategy"],
+            "score":         scored["score"],
+            "tag":           el.get("tag"),
+            "text":          (el.get("text") or "").strip()[:40],
+        })
+
+    results = _deduplicate(results)
+    results.sort(key=lambda x: -x["score"])
+    return results
+
+
+def _to_java_constants(results: list[dict]) -> str:
+    """Format results as Java private static final String constants."""
+    lines = ["    // ── Selectors (auto-generated by pom-selector-mcp) ──"]
+    for r in results:
+        sel = r["selector"].replace('"', '\\"')
+        lines.append(f'    private static final String {r["constant_name"]} = "{sel}";')
+    return "\n".join(lines)
+
+
+def _page_class_name(url: str) -> str:
+    """Derive a Java class name from URL path. e.g. /login → LoginPage"""
+    path = urlparse(url).path.strip("/").split("/")[-1] or "Home"
+    name = re.sub(r'[^a-zA-Z0-9]', ' ', path)
+    name = ''.join(w.capitalize() for w in name.split())
+    return f"{name or 'Home'}Page"
+
+
+def _launch_browser(pw, headless: bool):
+    try:
+        return pw.chromium.launch(
+            headless=headless,
+            executable_path=CHROME_EXECUTABLE_PATH,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-extensions",
+                "--remote-debugging-port=0",
+            ]
+        )
+    except Exception:
+        return pw.chromium.launch(headless=headless, channel="chrome")
+
+
+# ── MCP Tools ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def scan_page_selectors(
+    url: str,
+    headless: bool = True,
+    min_score: int = 20,
+) -> str:
+    """
+    Visit a URL and scan its DOM for interactive and landmark elements.
+    Returns selectors ranked by quality (testId > aria > id > name > css > xpath).
+    Each selector includes a suggested Java constant name in UPPER_SNAKE_CASE.
+
+    Args:
+        url:       The full URL to scan (e.g. https://example.com/login)
+        headless:  Run browser headlessly (default True)
+        min_score: Only return selectors with score >= this value (default 20)
+
+    Returns:
+        JSON string with ranked selectors + Java constant block
+    """
+    with sync_playwright() as pw:
+        browser = _launch_browser(pw, headless)
+        page    = browser.new_page()
+        try:
+            elements = _scan_dom(page, url)
+        except PWTimeout:
+            browser.close()
+            return json.dumps({"error": f"Page load timed out after {PAGE_TIMEOUT_MS}ms: {url}"})
+        except Exception as e:
+            browser.close()
+            return json.dumps({"error": str(e)})
+
+        browser.close()
+
+    results = _build_results(elements)
+    results = [r for r in results if r["score"] >= min_score]
+
+    java_block = _to_java_constants(results)
+
+    return json.dumps({
+        "url":            url,
+        "total_elements": len(results),
+        "selectors":      results,
+        "java_constants": java_block,
+    }, indent=2)
+
+
+@mcp.tool()
+def generate_java_pom(
+    url: str,
+    package_name: str = "pages",
+    headless: bool = True,
+) -> str:
+    """
+    Visit a URL, scan its DOM, and generate a complete Java Playwright
+    Page Object Model (POM) class — ready to paste into your project.
+
+    Follows conventions from the playwright-pom skill:
+      - Extends BasePage
+      - Constants in UPPER_SNAKE_CASE at the top
+      - Methods grouped: Navigation → Actions → Assertions
+
+    Args:
+        url:          Full URL to scan (e.g. https://example.com/login)
+        package_name: Java package for the class (default "pages")
+        headless:     Run browser headlessly (default True)
+
+    Returns:
+        String containing the complete Java POM class
+    """
+    raw = scan_page_selectors(url=url, headless=headless, min_score=30)
+    data = json.loads(raw)
+
+    if "error" in data:
+        return f"// ERROR scanning page: {data['error']}"
+
+    results    = data["selectors"]
+    class_name = _page_class_name(url)
+
+    # ── Separate elements by type ──────────────────────────
+    inputs   = [r for r in results if r["tag"] in ("input", "textarea", "select")]
+    buttons  = [r for r in results if r["tag"] == "button"]
+    links    = [r for r in results if r["tag"] == "a"]
+    headings = [r for r in results if r["tag"] in ("h1", "h2", "h3")]
+    others   = [r for r in results if r["tag"] not in ("input","textarea","select","button","a","h1","h2","h3")]
+
+    def const_block(items, comment):
+        if not items:
+            return ""
+        lines = [f"    // {comment}"]
+        for r in items:
+            sel = r["selector"].replace('"', '\\"')
+            lines.append(f'    private static final String {r["constant_name"]} = "{sel}";')
+        return "\n".join(lines) + "\n"
+
+    constants = "\n".join(filter(None, [
+        const_block(inputs,   "── Inputs ──"),
+        const_block(buttons,  "── Buttons ──"),
+        const_block(links,    "── Links ──"),
+        const_block(headings, "── Headings ──"),
+        const_block(others,   "── Other Elements ──"),
+    ]))
+
+    # ── Action methods for inputs ──────────────────────────
+    action_methods = []
+    for r in inputs:
+        cname  = r["constant_name"]
+        method = re.sub(r'_INPUT$|_TEXTAREA$|_DROPDOWN$', '', cname)
+        method = ''.join(w.capitalize() for w in method.lower().split('_'))
+        tag    = r["tag"]
+        if tag == "select":
+            action_methods.append(
+                f"    public void select{method}(String value) {{\n"
+                f"        page.selectOption({cname}, value);\n"
+                f"    }}"
+            )
+        else:
+            action_methods.append(
+                f"    public void enter{method}(String value) {{\n"
+                f"        page.fill({cname}, value);\n"
+                f"    }}"
+            )
+
+    # ── Click methods for buttons ──────────────────────────
+    click_methods = []
+    for r in buttons:
+        cname  = r["constant_name"]
+        method = re.sub(r'_BUTTON$', '', cname)
+        method = ''.join(w.capitalize() for w in method.lower().split('_'))
+        click_methods.append(
+            f"    public void click{method}Button() {{\n"
+            f"        page.click({cname});\n"
+            f"    }}"
+        )
+
+    # ── Visibility getters for headings / key elements ──────
+    getter_methods = []
+    for r in headings[:3]:
+        cname  = r["constant_name"]
+        method = re.sub(r'_HEADING$', '', cname)
+        method = ''.join(w.capitalize() for w in method.lower().split('_'))
+        getter_methods.append(
+            f"    public boolean is{method}Visible() {{\n"
+            f"        return page.isVisible({cname});\n"
+            f"    }}"
+        )
+        getter_methods.append(
+            f"    public String get{method}Text() {{\n"
+            f"        return page.textContent({cname});\n"
+            f"    }}"
+        )
+
+    all_methods = "\n\n".join(filter(None, [
+        "\n\n".join(action_methods) if action_methods else None,
+        "\n\n".join(click_methods)  if click_methods  else None,
+        "\n\n".join(getter_methods) if getter_methods  else None,
+    ]))
+
+    java = f"""package {package_name};
+
+import com.microsoft.playwright.Page;
+
+/**
+ * Page Object for: {url}
+ * Auto-generated by pom-selector-mcp — review and adjust selectors as needed.
+ */
+public class {class_name} extends BasePage {{
+
+{constants}
+    public {class_name}(Page page) {{
+        super(page);
+    }}
+
+    // ── Navigation ──────────────────────────────────────────────────────────
+
+    public void navigateTo() {{
+        page.navigate("{url}");
+    }}
+
+    // ── Actions ─────────────────────────────────────────────────────────────
+
+{all_methods}
+
+    // ── Assertions / Getters ─────────────────────────────────────────────────
+
+    public String getPageTitle() {{
+        return page.title();
+    }}
+
+}}
+"""
+    return java
+
+
+@mcp.tool()
+def scan_element(
+    url: str,
+    css_selector: str,
+    headless: bool = True,
+) -> str:
+    """
+    Deep-dive a single element on a page.
+    Returns all attributes, computed role, visibility, and suggested selectors.
+
+    Useful when: you know roughly what element you want but want the best selector for it.
+
+    Args:
+        url:          Full URL where the element lives
+        css_selector: A rough CSS selector to find the element (e.g. "form button")
+        headless:     Run browser headlessly (default True)
+
+    Returns:
+        JSON with element details + best selector suggestion
+    """
+    with sync_playwright() as pw:
+        browser = _launch_browser(pw, headless)
+        page    = browser.new_page()
+        try:
+            page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=PAGE_TIMEOUT_MS)
+
+            el_data = page.evaluate(f"""
+            () => {{
+                const el = document.querySelector('{css_selector}');
+                if (!el) return null;
+                const attrs = {{}};
+                for (const attr of el.attributes) attrs[attr.name] = attr.value;
+                return {{
+                    tag:        el.tagName.toLowerCase(),
+                    attributes: attrs,
+                    text:       (el.innerText || el.value || '').trim().substring(0, 100),
+                    outerHTML:  el.outerHTML.substring(0, 300),
+                    visible:    el.offsetWidth > 0 && el.offsetHeight > 0,
+                }};
+            }}
+            """)
+        except Exception as e:
+            browser.close()
+            return json.dumps({"error": str(e)})
+
+        browser.close()
+
+    if not el_data:
+        return json.dumps({"error": f"No element found matching: {css_selector}"})
+
+    # Build a flat dict for scoring
+    flat = {
+        "tag":        el_data["tag"],
+        "text":       el_data["text"],
+        **el_data["attributes"],
+        "classes":    el_data["attributes"].get("class", "").split(),
+    }
+    scored = score_and_build(flat)
+    constant = _to_java_constant_name(flat)
+
+    return json.dumps({
+        "element":          el_data,
+        "best_selector":    scored["selector"],
+        "strategy":         scored["strategy"],
+        "score":            scored["score"],
+        "java_constant":    f'private static final String {constant} = "{scored["selector"]}";',
+    }, indent=2)
+
+
+# ── Entry Point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
