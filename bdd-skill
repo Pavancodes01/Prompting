@@ -1,0 +1,172 @@
+---
+name: bdd-step-definitions
+description: >
+  Generate, complete, or fix Cucumber step definitions in Java for a BDD Playwright project.
+  Use this skill whenever the user asks to: write step definitions, implement a Cucumber step,
+  wire up a .feature file step to Java code, fix a "step not found" error, add steps for a
+  new scenario, or refactor existing step definitions. Also trigger when the user pastes a
+  Gherkin scenario and asks "write the Java for this" or "implement these steps". Always use
+  this skill when Cucumber + Java + Playwright step definitions are involved.
+---
+
+# BDD Step Definitions Skill (Cucumber + Java + Playwright)
+
+## Project Stack Assumptions
+- **Test Framework**: Cucumber 7.x with JUnit 5
+- **Browser Automation**: Playwright for Java
+- **Pattern**: Page Object Model (POM)
+- **DI**: PicoContainer or Spring (ask user if unknown)
+- **Step Definition Location**: `src/test/java/stepdefinitions/`
+- **Page Objects Location**: `src/test/java/pages/`
+
+---
+
+## Step Definition Rules
+
+### 1. Annotations
+Use correct Cucumber annotations from `io.cucumber.java.en.*`:
+```java
+import io.cucumber.java.en.Given;
+import io.cucumber.java.en.When;
+import io.cucumber.java.en.Then;
+import io.cucumber.java.en.And;
+```
+
+### 2. Class Structure
+```java
+package stepdefinitions;
+
+import io.cucumber.java.en.*;
+import pages.LoginPage;
+import org.assertj.core.api.Assertions;
+
+public class LoginSteps {
+
+    private final LoginPage loginPage;
+
+    // Inject via constructor (PicoContainer DI)
+    public LoginSteps(PlaywrightContext context) {
+        this.loginPage = new LoginPage(context.getPage());
+    }
+
+    @Given("the user is on the login page")
+    public void userIsOnLoginPage() {
+        loginPage.navigateTo();
+    }
+
+    @When("the user enters username {string} and password {string}")
+    public void userEntersCredentials(String username, String password) {
+        loginPage.enterUsername(username);
+        loginPage.enterPassword(password);
+    }
+
+    @Then("the user should see the dashboard")
+    public void userSeesDashboard() {
+        Assertions.assertThat(loginPage.isDashboardVisible()).isTrue();
+    }
+}
+```
+
+### 3. Parameter Types
+| Gherkin Syntax | Java Type |
+|---|---|
+| `{string}` | `String` |
+| `{int}` | `int` |
+| `{double}` | `double` |
+| `{word}` | `String` (no spaces) |
+| `{boolean}` | `boolean` |
+| DataTable | `io.cucumber.datatable.DataTable` |
+
+### 4. DataTable Example
+```java
+@When("the user fills the form with:")
+public void userFillsForm(DataTable dataTable) {
+    Map<String, String> formData = dataTable.asMap(String.class, String.class);
+    page.fill("#name", formData.get("name"));
+    page.fill("#email", formData.get("email"));
+}
+```
+
+### 5. Hooks
+```java
+import io.cucumber.java.Before;
+import io.cucumber.java.After;
+import io.cucumber.java.Scenario;
+
+public class Hooks {
+
+    @Before
+    public void setUp(Scenario scenario) {
+        // runs before each scenario
+    }
+
+    @After
+    public void tearDown(Scenario scenario) {
+        if (scenario.isFailed()) {
+            // take screenshot on failure
+            byte[] screenshot = page.screenshot();
+            scenario.attach(screenshot, "image/png", "failure-screenshot");
+        }
+    }
+}
+```
+
+---
+
+## Naming Conventions
+- Step definition class name: `<Feature>Steps.java` (e.g., `LoginSteps.java`, `CheckoutSteps.java`)
+- Method names: camelCase, describe the action (e.g., `userClicksSubmitButton`)
+- One class per feature area, not one class per step
+- Keep business logic in Page Objects, not in step definitions
+
+---
+
+## Common Mistakes to Avoid
+- ❌ Don't write Playwright locators directly in step definitions — use Page Objects
+- ❌ Don't hardcode URLs — use config/properties file
+- ❌ Don't use `Thread.sleep()` — use Playwright's built-in auto-wait or `waitFor*` methods
+- ✅ Keep steps readable like English sentences
+- ✅ Reuse existing steps — don't duplicate
+
+---
+
+## PlaywrightContext Shared Object (DI Pattern)
+```java
+package context;
+
+import com.microsoft.playwright.*;
+import io.cucumber.java.After;
+import io.cucumber.java.Before;
+
+public class PlaywrightContext {
+    private Playwright playwright;
+    private Browser browser;
+    private Page page;
+
+    @Before
+    public void setUp() {
+        playwright = Playwright.create();
+        browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(false));
+        page = browser.newPage();
+    }
+
+    public Page getPage() { return page; }
+
+    @After
+    public void tearDown() {
+        browser.close();
+        playwright.close();
+    }
+}
+```
+
+---
+
+## Output Format
+When generating step definitions:
+1. Show the `.feature` snippet first (if not already provided)
+2. Show the full Java step definition class
+3. Show which Page Object methods are being called
+4. Note any missing Page Object methods that need to be created
+
+Read `references/examples.md` for real project examples if available.
