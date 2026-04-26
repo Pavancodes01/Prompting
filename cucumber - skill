@@ -1,0 +1,164 @@
+---
+name: cucumber-feature-writer
+description: >
+  Write, review, or improve Cucumber .feature files using Gherkin syntax for a BDD Java project.
+  Use this skill whenever the user asks to: write a feature file, create a BDD scenario,
+  convert a user story or requirement into Gherkin, add new scenarios to an existing feature,
+  review a feature file for best practices, write scenario outlines with examples tables,
+  or create background steps. Trigger when user says "write feature file for X",
+  "convert this story to BDD", "write Gherkin for X", "add scenarios for X", or
+  "create test cases in Cucumber format". Always use this skill for .feature file work.
+---
+
+# Cucumber Feature File Writer Skill (Gherkin BDD)
+
+## What is a Feature File?
+A `.feature` file is a plain English description of what your application should do,
+written in a format called **Gherkin**. It acts as both documentation AND test cases.
+
+---
+
+## Gherkin Keywords
+
+| Keyword | Purpose | Example |
+|---------|---------|---------|
+| `Feature` | Name of the feature being tested | `Feature: User Login` |
+| `Background` | Steps that run before EVERY scenario | `Background: Given user is on homepage` |
+| `Scenario` | A single test case | `Scenario: Successful login` |
+| `Scenario Outline` | Parameterized test (runs multiple times) | `Scenario Outline: Login with <role>` |
+| `Examples` | Data table for Scenario Outline | `Examples: \| user \| admin \|` |
+| `Given` | Precondition / setup state | `Given the user is on the login page` |
+| `When` | The action the user performs | `When the user clicks the login button` |
+| `Then` | The expected result | `Then the user should see the dashboard` |
+| `And` | Continue previous Given/When/Then | `And the user enters valid password` |
+| `But` | Negative continuation | `But the error message should not appear` |
+| `@tag` | Group/filter scenarios | `@smoke @regression` |
+
+---
+
+## Feature File Template
+
+```gherkin
+@login @smoke
+Feature: User Login
+  As a registered user
+  I want to log into the application
+  So that I can access my account
+
+  Background:
+    Given the application is running
+    And the user is on the login page
+
+  @positive
+  Scenario: Successful login with valid credentials
+    When the user enters username "pavan@test.com" and password "Password@123"
+    And the user clicks the login button
+    Then the user should be redirected to the dashboard
+    And the welcome message "Welcome, Pavan!" should be displayed
+
+  @negative
+  Scenario: Login fails with invalid password
+    When the user enters username "pavan@test.com" and password "WrongPass"
+    And the user clicks the login button
+    Then an error message "Invalid credentials" should be displayed
+    And the user should remain on the login page
+
+  @smoke
+  Scenario Outline: Login with different user roles
+    When the user enters username "<username>" and password "<password>"
+    And the user clicks the login button
+    Then the user should see the "<dashboard>" dashboard
+
+    Examples:
+      | username         | password      | dashboard |
+      | admin@test.com   | Admin@123     | Admin     |
+      | viewer@test.com  | Viewer@123    | Viewer    |
+      | editor@test.com  | Editor@123    | Editor    |
+```
+
+---
+
+## Gherkin Best Practices
+
+### ✅ DO
+- Write steps from the **user's perspective** ("the user clicks..." not "click button")
+- Keep scenarios **independent** — each should work on its own
+- Use **Background** for repeated Given steps across all scenarios
+- Use **Scenario Outline + Examples** for data-driven tests (same flow, different data)
+- Add **tags** (`@smoke`, `@regression`, `@login`) to group tests
+- Keep scenarios **short** — ideally 3–7 steps
+- Write in **present tense** ("the user is", "the page shows")
+
+### ❌ DON'T
+- Don't mention UI details like button colors or CSS classes
+  - ❌ `When the user clicks the blue submit button at the bottom right`
+  - ✅ `When the user clicks the login button`
+- Don't write implementation details
+  - ❌ `When the POST request is sent to /api/login`
+  - ✅ `When the user submits the login form`
+- Don't create dependent scenarios (Scenario 2 relying on Scenario 1 passing)
+- Don't write more than 10 steps in one scenario — split into smaller ones
+
+---
+
+## Common Feature File Patterns
+
+### Pattern 1: DataTable (for form data)
+```gherkin
+Scenario: User fills registration form
+  When the user fills the registration form with:
+    | Field     | Value              |
+    | Full Name | Pavan Kumar        |
+    | Email     | pavan@example.com  |
+    | Phone     | 9876543210         |
+  And the user submits the form
+  Then the registration success message should appear
+```
+
+### Pattern 2: Scenario Outline (data-driven)
+```gherkin
+Scenario Outline: Search products by category
+  When the user searches for "<category>"
+  Then the results should show products under "<expected_section>"
+
+  Examples:
+    | category    | expected_section |
+    | Electronics | Gadgets          |
+    | Clothing    | Apparel          |
+    | Books       | Literature       |
+```
+
+### Pattern 3: Background (common setup)
+```gherkin
+Background:
+  Given the user is logged in as "admin"
+  And the user navigates to the orders page
+```
+
+---
+
+## Tags Strategy
+
+| Tag | When to Use |
+|-----|-------------|
+| `@smoke` | Critical happy path tests — run on every build |
+| `@regression` | Full suite — run before releases |
+| `@positive` | Tests expected to succeed |
+| `@negative` | Tests for error/failure cases |
+| `@wip` | Work in progress — exclude from CI |
+| `@<feature-name>` | Group by feature: `@login`, `@checkout` |
+
+---
+
+## File Naming & Location
+- Location: `src/test/resources/features/`
+- File name: lowercase with hyphens → `user-login.feature`, `product-search.feature`
+- One feature per file (don't mix login and checkout in same file)
+
+---
+
+## Output Format When Writing Feature Files
+1. Show complete `.feature` file
+2. List the step definition method signatures that will be needed
+3. Note which steps can be reused from existing step definitions
+4. Suggest tags based on the scenario type
