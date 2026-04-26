@@ -1,0 +1,196 @@
+---
+name: playwright-pom
+description: >
+  Create or update Page Object Model (POM) classes for a Playwright Java project.
+  Use this skill whenever the user asks to: create a new page object, add a locator,
+  add a method to a page class, refactor raw Playwright calls into a page object,
+  generate a page class from a URL or screenshot description, or fix a broken locator.
+  Also trigger when user says "create a page for X", "add method to page class",
+  "write the POM for this page", or pastes HTML and asks to write locators.
+  Always use this skill for any Playwright Java POM work.
+---
+
+# Playwright Java - Page Object Model (POM) Skill
+
+## Project Stack Assumptions
+- **Language**: Java 11+
+- **Library**: Playwright for Java (`com.microsoft.playwright`)
+- **Pattern**: Page Object Model
+- **Assertions**: AssertJ (`org.assertj.core.api.Assertions`)
+- **Location**: `src/test/java/pages/`
+
+---
+
+## Base Page Class (Always Extend This)
+
+```java
+package pages;
+
+import com.microsoft.playwright.Page;
+
+public abstract class BasePage {
+
+    protected final Page page;
+
+    public BasePage(Page page) {
+        this.page = page;
+    }
+
+    public void navigateTo(String url) {
+        page.navigate(url);
+    }
+
+    public String getTitle() {
+        return page.title();
+    }
+
+    public void waitForPageLoad() {
+        page.waitForLoadState();
+    }
+}
+```
+
+---
+
+## Page Object Template
+
+```java
+package pages;
+
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.Locator;
+
+public class LoginPage extends BasePage {
+
+    // --- Locators (define at top as constants) ---
+    private static final String USERNAME_INPUT = "#username";
+    private static final String PASSWORD_INPUT = "#password";
+    private static final String LOGIN_BUTTON   = "button[type='submit']";
+    private static final String ERROR_MESSAGE  = ".error-message";
+    private static final String DASHBOARD_HEADER = "h1.dashboard-title";
+
+    public LoginPage(Page page) {
+        super(page);
+    }
+
+    // --- Navigation ---
+    public void navigateTo() {
+        page.navigate("https://yourapp.com/login");
+    }
+
+    // --- Actions ---
+    public void enterUsername(String username) {
+        page.fill(USERNAME_INPUT, username);
+    }
+
+    public void enterPassword(String password) {
+        page.fill(PASSWORD_INPUT, password);
+    }
+
+    public void clickLoginButton() {
+        page.click(LOGIN_BUTTON);
+    }
+
+    public void login(String username, String password) {
+        enterUsername(username);
+        enterPassword(password);
+        clickLoginButton();
+    }
+
+    // --- Assertions / Getters ---
+    public boolean isDashboardVisible() {
+        return page.isVisible(DASHBOARD_HEADER);
+    }
+
+    public String getErrorMessage() {
+        return page.textContent(ERROR_MESSAGE);
+    }
+
+    public boolean isErrorDisplayed() {
+        return page.isVisible(ERROR_MESSAGE);
+    }
+}
+```
+
+---
+
+## Locator Strategy (Priority Order)
+
+Use this priority when choosing locators:
+
+| Priority | Strategy | Example |
+|----------|-----------|---------|
+| 1st ✅ | Role-based (ARIA) | `page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Submit"))` |
+| 2nd ✅ | Test ID | `page.getByTestId("login-btn")` |
+| 3rd ✅ | Label | `page.getByLabel("Username")` |
+| 4th ✅ | Placeholder | `page.getByPlaceholder("Enter email")` |
+| 5th ⚠️ | CSS selector | `page.locator("#username")` |
+| 6th ❌ | XPath | `page.locator("//input[@id='user']")` — avoid if possible |
+
+---
+
+## Common Playwright Actions
+
+```java
+// Click
+page.click("selector");
+
+// Type / Fill
+page.fill("selector", "text");
+
+// Select dropdown
+page.selectOption("select#country", "India");
+
+// Checkbox
+page.check("input[type='checkbox']");
+
+// Wait for element
+page.waitForSelector(".success-banner");
+
+// Wait for URL
+page.waitForURL("**/dashboard");
+
+// Get text
+String text = page.textContent(".heading");
+
+// Is visible
+boolean visible = page.isVisible(".modal");
+
+// Screenshot
+page.screenshot(new Page.ScreenshotOptions().setPath(Paths.get("screenshot.png")));
+
+// Hover
+page.hover(".menu-item");
+
+// Keyboard
+page.press("input", "Enter");
+```
+
+---
+
+## Page Object Rules
+- ✅ One class per page / major component
+- ✅ All locators defined as private static final Strings at the top
+- ✅ Action methods return `void`, getter methods return values
+- ✅ Extend `BasePage`
+- ✅ No assertions inside page objects — assertions go in step definitions
+- ❌ No hardcoded waits (`Thread.sleep`) — use Playwright's auto-wait
+- ❌ No test logic inside page objects
+
+---
+
+## Naming Conventions
+| Item | Convention | Example |
+|------|-----------|---------|
+| Class | PascalCase + "Page" | `CheckoutPage.java` |
+| Locator constants | UPPER_SNAKE_CASE | `SUBMIT_BUTTON` |
+| Action methods | camelCase verb | `clickSubmitButton()` |
+| Getter methods | camelCase `get/is` | `getErrorMessage()`, `isModalOpen()` |
+
+---
+
+## Output Format When Generating a POM Class
+1. Show the complete Java class with all locators at top
+2. Group methods: Navigation → Actions → Assertions/Getters
+3. Note which locator strategy was used and why
+4. Mention if a BasePage is assumed or needs to be created
