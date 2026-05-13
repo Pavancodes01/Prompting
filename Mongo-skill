@@ -1,0 +1,186 @@
+-----
+
+## name: spring-mongodb-skill
+description: >
+Use this skill whenever working on a Spring Boot project that uses MongoDB — in OpenCode.
+Trigger immediately for any of these: “write MongoDB code”, “generate repository for X”,
+“add entity for this collection”, “write aggregation query”, “fix slow MongoDB query”,
+“implement this feature with MongoDB”, “what are my collections”, “find relations in my DB”,
+“check my indexes”, “write code in sync with my project”, “implement this endpoint”,
+“query keeps timing out”, “MongoDB is slow”, “use MCP to look at my database”,
+“generate test cases for my repo”, “review my MongoDB code”.
+This skill MUST also trigger when the user pastes a task or ticket and the project uses
+MongoDB — even if they don’t say “MongoDB” explicitly. If the codebase has @Document or
+MongoRepository anywhere, this skill is relevant. Do not write MongoDB code without it.
+
+# Spring Data MongoDB — OpenCode Skill
+
+## What This Skill Produces
+
+Every task ends with all six of these — no exceptions:
+
+|#|Section          |What it is                                              |
+|-|-----------------|--------------------------------------------------------|
+|A|Discovery Summary|What was found in project files + live DB               |
+|B|Current Flow     |How code works NOW, numbered steps, problems flagged    |
+|C|Generated Code   |Complete Java files, project-synced, ready to paste     |
+|D|Recommended Flow |How it works AFTER changes, numbered steps              |
+|E|Test Cases       |JUnit 5 + @DataMongoTest + Mockito, runnable immediately|
+|F|Review + Rating  |Requirement cross-check + scored quality rating /10     |
+
+-----
+
+## Reference Files
+
+Load these at the start of the relevant phase. Don’t load all at once.
+
+|Reference                                   |Load when                                 |
+|--------------------------------------------|------------------------------------------|
+|`references/mongo-mcp-tools.md`             |Start of Phase 2 — before any MCP call    |
+|`references/spring-data-mongodb-patterns.md`|Start of Phase 3 — before writing any Java|
+|`references/review-and-output-protocol.md`  |Start of Phase 4 — before producing output|
+
+-----
+
+## Phase 1 — Read the Project
+
+Use OpenCode’s file tools to read these before writing anything. You need this context to
+generate code that fits seamlessly — wrong Lombok style, wrong naming convention, or wrong
+Spring Boot version breaks integration.
+
+```
+pom.xml or build.gradle
+  → java.version, spring-boot.version, is Lombok in dependencies?
+  → spring-data-mongodb version (matters for annotation availability)
+
+src/main/resources/application.yml (or .properties)
+  → spring.data.mongodb.uri  → extract the database name from here
+  → spring.data.mongodb.auto-index-creation  → flag if true in non-dev
+
+src/main/java/**/config/Mongo*.java  (if exists)
+  → Custom MongoTemplate? Custom converters? WriteConcern override?
+
+src/main/java/**/*Document.java  or  *Entity.java  or  *Model.java
+  → Naming convention (@Document classes) + Lombok annotations in use
+
+src/main/java/**/*Repository.java
+  → Method naming patterns + whether @Query is used + Pageable presence
+
+src/main/java/**/*Service.java  (only files relevant to the task)
+  → Join patterns + error handling style + how queries are called
+
+src/main/java/**/*Controller.java  (only files relevant to the task)
+  → Request params + DTO shapes + pagination contract
+```
+
+Capture this before Phase 2 — it drives every code decision:
+
+```
+java_version        → determines if records are available for DTOs
+spring_boot_version → affects available annotations
+uses_lombok         → @Data+@Builder vs plain getters/setters
+naming_convention   → *Document | *Entity | plain POJO
+db_name             → required for every MCP call
+auto_index_creation → warn if true outside dev profile
+existing_entities   → list of @Document classes already in project
+```
+
+-----
+
+## Phase 2 — Introspect the Live Database
+
+> Load `references/mongo-mcp-tools.md` before any call.
+
+The reason to introspect before coding: field names in MongoDB are often different from what
+you’d guess (snake_case vs camelCase, abbreviations, legacy names). Getting these wrong means
+@Field annotations are missing and queries silently return nothing.
+
+Run these in order:
+
+```
+1. list_collections(db_name)
+   → Exact collection names for @Document(collection = "...")
+
+2. find(db, collection, filter={}, limit=3, sort={createdAt:-1})   ← per collection
+   → Real field names, real types, real nesting. This is ground truth.
+
+3. list_indexes(db, collection)   ← per collection
+   → Every index = a @Indexed or @CompoundIndex needed in Java
+
+4. count_documents(db, collection, {})
+   → >10K docs → Pageable mandatory on all repo methods
+
+5. aggregate($lookup)   ← only when cross-collection relations suspected
+   → Confirm the relation actually works in the DB
+
+6. aggregate($group by status/type/category fields)
+   → Get all real enum values before defining the Java enum
+```
+
+Relation patterns decoded from sampled documents:
+
+```
+"userId": "64abc..."       → Manual Reference  — store String, join in service
+"address": { "city":... }  → Embedded Document — POJO without @Document
+"items": [{ "sku":... }]   → Embedded List     — List<ItemPojo>
+"tagIds": ["a","b"]        → Ref List          — List<String>
+"$ref"/"$id" pattern       → DBRef (legacy)    — do NOT replicate, warn user
+```
+
+-----
+
+## Phase 3 — Generate Code
+
+> Load `references/spring-data-mongodb-patterns.md` before writing any Java.
+
+These rules are non-negotiable — each one prevents a specific category of bug:
+
+```
+@Document(collection = "exact_name_from_list_collections")   ← wrong name = empty results
+@Field("db_name") when Java name ≠ MongoDB field name        ← missing = null fields
+Never @DBRef — store ID as String, join in service            ← @DBRef causes N+1
+Match Lombok + annotation style of the existing project       ← style inconsistency fails review
+@Indexed on every field list_indexes showed                   ← missing = COLLSCAN
+@CompoundIndex at class level for multi-field indexes
+Pageable on all repo methods when count > 10K
+MongoTemplate + Criteria for dynamic/multi-condition queries
+Aggregation API (not raw JSON strings) for pipelines
+Service layer owns all cross-collection joins
+@CreatedDate + @LastModifiedDate if @EnableMongoAuditing present
+```
+
+Generate in this order (dependency order — each step uses the previous):
+
+```
+1. Enum classes          (referenced by entity — define first)
+2. Embedded POJOs        (no @Document — used inside entity)
+3. @Document entity      (the main class)
+4. @Repository interface (query methods + Pageable)
+5. Service methods       (business logic + joins + error handling)
+6. DTO / Projection      (response shape — records on Java 17+)
+7. MongoConfig changes   (only if new converters or index config needed)
+```
+
+-----
+
+## Phase 4 — Produce the Full Output
+
+> Load `references/review-and-output-protocol.md` before writing the response.
+
+This phase defines exactly what to write for sections A through F.
+The most important rule: write complete files, not snippets. Code that’s missing imports
+or package declarations forces the user to fix it before they can use it.
+
+-----
+
+## Task → Phase Quick Map
+
+|User request                      |Run                                                                   |
+|----------------------------------|----------------------------------------------------------------------|
+|“Analyze my collections / schema” |Phase 1 + Phase 2 → Section A only                                    |
+|“Implement feature X”             |All phases → All sections                                             |
+|“Fix slow query”                  |Phase 1 (find query) + Phase 2 (indexes) + Phase 3 (rewrite) + Phase 4|
+|“Generate tests for existing repo”|Phase 1 (read repo) → Section E only                                  |
+|“Add new field to entity”         |Phase 1 + Phase 2 (verify field in DB) + Phase 3 + Phase 4            |
+|“Write aggregation report”        |Phase 2 (sample) + Phase 3 (agg) + Phase 4                            |
+|“What are my relations”           |Phase 2 (all 6 calls) → Section A only                                |
