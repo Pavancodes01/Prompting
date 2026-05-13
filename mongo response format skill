@@ -1,0 +1,472 @@
+# Review and Output Protocol
+
+This file defines the exact format for every Spring Data MongoDB task response.
+Read it fully before writing any output. All six sections are mandatory.
+
+-----
+
+## Output Checklist (verify before finishing)
+
+```
+[ ] Section A — Discovery Summary        (what MCP + file reads found)
+[ ] Section B — Current Flow             (numbered, problems highlighted)
+[ ] Section C — Generated Code           (complete files, all imports, project-synced)
+[ ] Section D — Recommended Flow         (numbered, maps each fix to each problem)
+[ ] Section E — Test Cases               (repo test + service test, both runnable)
+[ ] Section F — Review + Rating          (cross-check table + scored dimensions)
+```
+
+-----
+
+## Section A — Discovery Summary
+
+**Purpose:** Prove to the user that the generated code is based on real data, not assumptions.
+Show exactly what was found in both the project files and the live database.
+
+```markdown
+## A. Discovery Summary
+
+### Project (from file reads)
+- Java: 17
+- Spring Boot: 3.2.1
+- Lombok: yes — @Data + @Builder pattern found in existing entities
+- DB name: bnp_trade_db  (from application.yml)
+- auto-index-creation: true  ⚠️ Must be false before production deployment
+- Existing entities: OrderDocument, UserDocument, ProductDocument
+
+### Collections (from list_collections)
+  orders, users, products, categories
+
+### Document Samples (from find — 3 docs each)
+  orders fields:
+    _id           String
+    user_id       String   → references users._id (manual ref)
+    order_status  String   → enum (verified via $group: PENDING, SHIPPED, COMPLETED, CANCELLED)
+    total_amount  Double
+    line_items    Array of embedded objects
+    created_at    ISODate
+    updated_at    ISODate
+
+### Indexes (from list_indexes)
+  orders:
+    user_id_1           single, on user_id
+    status_date_idx     compound, {order_status:1, created_at:-1}
+  users:
+    email_unique        single, unique, on email
+
+### Relations Confirmed (from aggregate $lookup)
+  orders.user_id → users._id   ✅  $lookup returns data
+
+### Enum Values (from aggregate $group)
+  order_status: PENDING, SHIPPED, COMPLETED, CANCELLED
+
+### Counts (from count_documents)
+  orders: 45,231   → Pageable required on all methods
+  users:  8,104    → Pageable recommended
+```
+
+-----
+
+## Section B — Current Flow
+
+**Purpose:** Show the user what happens NOW, step by step. Numbered steps. Problems clearly flagged.
+This gives context for why the changes in Section D matter.
+
+If there is no existing implementation, write: `No existing implementation found for this feature.`
+
+```markdown
+## B. Current Flow (Before Changes)
+
+Feature: Get order history for a user
+
+1. GET /api/orders?userId=abc arrives at OrderController.getOrders(userId)
+2. Controller calls orderService.getOrderHistory(userId)
+3. Service calls orderRepository.findByUserId(userId)
+   → MongoDB runs: db.orders.find({ userId: "abc" })
+   ⚠️ PROBLEM 1: Field is "user_id" in DB, query uses "userId" — zero results
+   ⚠️ PROBLEM 2: No index on user_id — even if fixed, this is a COLLSCAN on 45K docs
+4. Empty list returned because of Problem 1
+5. Controller returns [] to client — user sees no orders
+
+Problems identified:
+  [P1] Missing @Field("user_id") → query targets non-existent field → always empty
+  [P2] No @Indexed on userId → COLLSCAN → ~3000ms even after P1 fixed
+  [P3] No Pageable → if fixed, would load all orders for a user at once
+  [P4] Returns raw Order entity → internal MongoDB fields exposed to client
+```
+
+-----
+
+## Section C — Generated Code
+
+**Purpose:** All Java files, fully implemented, ready to use.
+
+Rules for every file:
+
+- Include `package` declaration
+- Include all `import` statements
+- Write complete class body — no `// ... rest of code`
+- Add a one-line comment on non-obvious decisions
+- Match project Lombok + annotation style exactly
+
+```markdown
+## C. Generated Code
+
+### OrderStatus.java
+\`\`\`java
+// File: src/main/java/com/example/domain/OrderStatus.java
+// Values sourced from aggregate $group on orders.order_status
+
+package com.example.domain;
+
+public enum OrderStatus {
+    PENDING,
+    SHIPPED,
+    COMPLETED,
+    CANCELLED
+}
+\`\`\`
+
+### LineItem.java (Embedded Document)
+\`\`\`java
+// File: src/main/java/com/example/domain/LineItem.java
+// Embedded inside Order.lineItems — no @Document annotation
+
+package com.example.domain;
+
+import lombok.Builder;
+import lombok.Data;
+import org.springframework.data.mongodb.core.mapping.Field;
+
+@Data
+@Builder
+public class LineItem {
+
+    @Field("product_id")
+    private String productId;
+
+    private Integer qty;
+
+    @Field("unit_price")
+    private Double unitPrice;
+
+    @Field("product_name")
+    private String productName;
+}
+\`\`\`
+
+### Order.java (@Document Entity)
+\`\`\`java
+// File: src/main/java/com/example/domain/Order.java
+// Collection name from list_collections. Field names from find sample. Indexes from list_indexes.
+
+package com.example.domain;
+
+// ... full implementation (see patterns reference)
+\`\`\`
+
+### OrderRepository.java
+\`\`\`java
+// File: src/main/java/com/example/repository/OrderRepository.java
+package com.example.repository;
+
+// ... full implementation
+\`\`\`
+
+### OrderService.java (relevant methods only — don't rewrite the whole class)
+\`\`\`java
+// Added to: src/main/java/com/example/service/OrderService.java
+// Reason: getOrderHistory method added with batch user loading
+
+// ... new method only
+\`\`\`
+
+### OrderSummaryDto.java
+\`\`\`java
+// File: src/main/java/com/example/dto/OrderSummaryDto.java
+// Record — Java 17+. Maps Order entity to safe response shape.
+
+package com.example.dto;
+
+// ... full record definition
+\`\`\`
+```
+
+-----
+
+## Section D — Recommended Flow
+
+**Purpose:** Show the user how the code works AFTER the changes, step by step.
+Each step maps back to a problem from Section B and shows what changed.
+
+```markdown
+## D. Recommended Flow (After Changes)
+
+Feature: Get order history for a user
+
+1. GET /api/orders?userId=abc&page=0&size=20 arrives at OrderController.getOrders()
+2. Controller calls orderService.getOrderHistory("abc", PageRequest.of(0, 20))
+3. Service calls orderRepository.findByUserId("abc", pageable)
+   → MongoDB runs: db.orders.find({ user_id: "abc" }).skip(0).limit(20)
+   ✅ P1 Fixed: @Field("user_id") → correct field targeted → returns real data
+   ✅ P2 Fixed: @Indexed on user_id → IXSCAN → 3000ms → 15ms (200x faster)
+   ✅ P3 Fixed: Pageable → 20 docs returned, not all 45K
+4. Service maps Page<Order> → Page<OrderSummaryDto>
+   ✅ P4 Fixed: DTO response → only safe fields exposed to client
+5. Controller returns Page<OrderSummaryDto> with pagination metadata
+
+Data Flow:
+  Client
+    ↓ GET /api/orders?userId=abc&page=0&size=20
+  OrderController.getOrders(userId, page, size)
+    ↓ orderService.getOrderHistory(userId, PageRequest.of(0, 20))
+  OrderService.getOrderHistory()
+    ↓ orderRepository.findByUserId(userId, pageable) — 2 queries: data + count
+  MongoDB  →  IXSCAN on user_id_1  →  20 matching docs
+    ↓
+  OrderService  →  .map(OrderSummaryDto::from)
+    ↓
+  Client  ←  Page<OrderSummaryDto> { content, totalElements, totalPages, ... }
+
+Performance improvement:
+  Before: COLLSCAN, 45,231 docs scanned, ~3000ms, returns all orders in memory
+  After:  IXSCAN, ~20 docs scanned, ~15ms, 20 docs paginated
+```
+
+-----
+
+## Section E — Test Cases
+
+**Purpose:** JUnit 5 tests that verify the generated code works. Both files must be complete
+and runnable without any changes by the user.
+
+Two files always:
+
+1. `*RepositoryTest` — uses `@DataMongoTest` (real embedded MongoDB, no mocks)
+1. `*ServiceTest` — uses `@ExtendWith(MockitoExtension.class)` (mocked repository, fast)
+
+```markdown
+## E. Test Cases
+
+### OrderRepositoryTest.java
+\`\`\`java
+package com.example.repository;
+
+import com.example.domain.Order;
+import com.example.domain.OrderStatus;
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.data.mongo.DataMongoTest;
+import org.springframework.data.domain.*;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@DataMongoTest
+class OrderRepositoryTest {
+
+    @Autowired OrderRepository orderRepository;
+
+    Order order1, order2;
+
+    @BeforeEach
+    void setUp() {
+        orderRepository.deleteAll();
+        order1 = orderRepository.save(Order.builder()
+            .userId("user-1").status(OrderStatus.COMPLETED)
+            .totalAmount(1500.0).currency("USD")
+            .createdAt(LocalDateTime.now().minusDays(1)).build());
+        order2 = orderRepository.save(Order.builder()
+            .userId("user-1").status(OrderStatus.PENDING)
+            .totalAmount(500.0).currency("USD")
+            .createdAt(LocalDateTime.now()).build());
+    }
+
+    @AfterEach
+    void tearDown() { orderRepository.deleteAll(); }
+
+    @Test
+    @DisplayName("findByUserId - returns all orders for user with pagination")
+    void findByUserId_returnsPaginatedOrders() {
+        Page<Order> result = orderRepository.findByUserId("user-1", PageRequest.of(0, 10));
+        assertThat(result.getTotalElements()).isEqualTo(2);
+        assertThat(result.getContent()).extracting(Order::getUserId).containsOnly("user-1");
+    }
+
+    @Test
+    @DisplayName("findByUserId - unknown user returns empty page")
+    void findByUserId_unknownUserReturnsEmpty() {
+        Page<Order> result = orderRepository.findByUserId("no-such-user", PageRequest.of(0, 10));
+        assertThat(result.getTotalElements()).isZero();
+    }
+
+    @Test
+    @DisplayName("findByUserIdAndStatus - filters by both user and status")
+    void findByUserIdAndStatus_filtersCorrectly() {
+        Page<Order> result = orderRepository.findByUserIdAndStatus(
+            "user-1", OrderStatus.COMPLETED, PageRequest.of(0, 10));
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).getStatus()).isEqualTo(OrderStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("existsByUserIdAndStatus - true when match found")
+    void existsByUserIdAndStatus_trueWhenFound() {
+        assertThat(orderRepository.existsByUserIdAndStatus("user-1", OrderStatus.COMPLETED)).isTrue();
+    }
+
+    @Test
+    @DisplayName("existsByUserIdAndStatus - false when no match")
+    void existsByUserIdAndStatus_falseWhenNotFound() {
+        assertThat(orderRepository.existsByUserIdAndStatus("user-1", OrderStatus.CANCELLED)).isFalse();
+    }
+
+    @Test
+    @DisplayName("countByStatus - counts correctly")
+    void countByStatus_returnsCorrectCount() {
+        assertThat(orderRepository.countByStatus(OrderStatus.PENDING)).isEqualTo(1);
+        assertThat(orderRepository.countByStatus(OrderStatus.COMPLETED)).isEqualTo(1);
+    }
+}
+\`\`\`
+
+### OrderServiceTest.java
+\`\`\`java
+package com.example.service;
+
+import com.example.domain.Order;
+import com.example.domain.OrderStatus;
+import com.example.dto.OrderSummaryDto;
+import com.example.exception.EntityNotFoundException;
+import com.example.repository.OrderRepository;
+import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.*;
+
+import java.util.*;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class OrderServiceTest {
+
+    @Mock OrderRepository orderRepository;
+    @InjectMocks OrderService orderService;
+
+    @Test
+    @DisplayName("getOrderHistory - returns paged DTOs for valid user")
+    void getOrderHistory_returnsDtoPage() {
+        Order order = Order.builder().id("o1").userId("u1")
+            .status(OrderStatus.COMPLETED).totalAmount(1500.0).build();
+        when(orderRepository.findByUserId(eq("u1"), any(Pageable.class)))
+            .thenReturn(new PageImpl<>(List.of(order)));
+
+        Page<OrderSummaryDto> result = orderService.getOrderHistory("u1", PageRequest.of(0, 10));
+
+        assertThat(result.getContent()).hasSize(1);
+        assertThat(result.getContent().get(0).id()).isEqualTo("o1");
+        verify(orderRepository).findByUserId(eq("u1"), any(Pageable.class));
+    }
+
+    @Test
+    @DisplayName("getOrderHistory - empty page when user has no orders")
+    void getOrderHistory_emptyForUserWithNoOrders() {
+        when(orderRepository.findByUserId(eq("u2"), any(Pageable.class))).thenReturn(Page.empty());
+        Page<OrderSummaryDto> result = orderService.getOrderHistory("u2", PageRequest.of(0, 10));
+        assertThat(result.getContent()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("getOrderById - throws EntityNotFoundException for unknown id")
+    void getOrderById_throwsWhenNotFound() {
+        when(orderRepository.findById("unknown")).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> orderService.getOrderById("unknown"))
+            .isInstanceOf(EntityNotFoundException.class)
+            .hasMessageContaining("unknown");
+    }
+
+    @Test
+    @DisplayName("getOrderById - returns DTO when found")
+    void getOrderById_returnsDtoWhenFound() {
+        Order order = Order.builder().id("o1").status(OrderStatus.PENDING).totalAmount(750.0).build();
+        when(orderRepository.findById("o1")).thenReturn(Optional.of(order));
+        OrderSummaryDto result = orderService.getOrderById("o1");
+        assertThat(result.id()).isEqualTo("o1");
+        assertThat(result.status()).isEqualTo(OrderStatus.PENDING);
+    }
+}
+\`\`\`
+```
+
+-----
+
+## Section F — Review + Cross-Check + Quality Rating
+
+**Purpose:** Verify the implementation is correct and rate it honestly.
+Scores should be accurate — not everything deserves a 9.
+
+### F.1 — Requirement Cross-Check
+
+```markdown
+### F.1 Requirement Cross-Check
+
+| Requirement | Implemented | Notes |
+|---|---|---|
+| Return paginated order history by user | ✅ | Page<OrderSummaryDto> with Pageable |
+| Filter by status | ✅ | findByUserIdAndStatus |
+| Sort by date descending | ✅ | Sort.by(DESC, "created_at") |
+| Return DTO not raw entity | ✅ | OrderSummaryDto record |
+| Handle user not found | ✅ | EntityNotFoundException |
+| Match existing project style | ✅ | @Data + @Builder, same as existing entities |
+```
+
+### F.2 — Code Quality Review
+
+```markdown
+### F.2 Code Quality Review
+
+Strengths:
++ @Field annotations match live MongoDB field names (verified via MCP find)
++ @Indexed and @CompoundIndex match live DB indexes (verified via MCP list_indexes)
++ Pageable on all repo methods (count is 45K — mandatory)
++ Batch loading in service (findAllById + Map) — no N+1
++ DTO response — client sees only what it needs
++ @EnableMongoAuditing + @CreatedDate — consistent with project's existing entities
+
+Limitations:
+! Two-query approach (findByUserId + count for Page) — acceptable for this load,
+  but consider $facet aggregation if both count and data are needed frequently
+
+Risks:
+~ auto-index-creation=true found in application.yml
+  Spring will attempt to create indexes on every startup
+  Set to false before ANY production or staging deployment
+```
+
+### F.3 — Quality Rating
+
+Score each dimension from 1–10. Be accurate.
+
+```markdown
+### F.3 Quality Rating
+
+| Dimension | Score | Reason |
+|---|---|---|
+| DB Sync | 10/10 | All field names and indexes verified via MCP — zero guessing |
+| Code Correctness | 9/10 | All requirements met; minor: no null check on currency field |
+| Performance | 9/10 | IXSCAN confirmed, Pageable added, batch join — no caching yet |
+| Project Consistency | 10/10 | Lombok style, naming, error handling match existing code |
+| Test Coverage | 9/10 | Happy path + edge cases + error case; no service integration test |
+| Maintainability | 8/10 | Clean and readable; could extract join logic to separate class at scale |
+
+OVERALL: 9.2 / 10
+
+Action required before production:
+  → Set auto-index-creation=false in the production application profile
+```
