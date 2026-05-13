@@ -1,0 +1,466 @@
+# MongoDB MCP Server — Tool Reference
+
+## Table of Contents
+
+1. [What the MCP Server Is](#what-the-mcp-server-is)
+1. [list_collections](#tool-1-list_collections)
+1. [find](#tool-2-find)
+1. [aggregate](#tool-3-aggregate)
+1. [list_indexes](#tool-4-list_indexes)
+1. [count_documents](#tool-5-count_documents)
+1. [get_collection_schema](#tool-6-get_collection_schema)
+1. [insert_one](#tool-7-insert_one)
+1. [update_one / update_many](#tool-8-update_one--update_many)
+1. [delete_one / delete_many](#tool-9-delete_one--delete_many)
+1. [create_index](#tool-10-create_index)
+1. [Call Order Cheatsheet](#recommended-call-order)
+1. [MCP Result → Java Annotation Map](#mcp-result--java-annotation-map)
+
+-----
+
+## What the MCP Server Is
+
+The MongoDB MCP server is a live connection between OpenCode and your running MongoDB instance.
+Instead of assuming what the database looks like, you query it directly before writing any code.
+This eliminates the #1 cause of broken Spring Data MongoDB code: field names in Java that do not
+match the actual field names in MongoDB documents.
+
+-----
+
+## Tool 1: list_collections
+
+**Definition:** Lists every collection that exists in a MongoDB database. A collection in MongoDB
+is equivalent to a table in SQL. This is always the first call because the exact collection name
+must be used in `@Document(collection = "...")` — if the name is even slightly wrong, Spring Data
+silently creates a new empty collection and all queries return nothing.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name"
+}
+```
+
+- `database` (required): The DB name from `spring.data.mongodb.uri` in application.yml.
+
+**Example:**
+
+```
+Input:  list_collections({ "database": "bnp_trade_db" })
+Output: ["users", "orders", "products", "audit_logs"]
+```
+
+**What to do with the result:**
+
+```
+"orders"     →   @Document(collection = "orders")     // EXACT match, no guessing
+"audit_logs" →   @Document(collection = "audit_logs") // underscore preserved
+```
+
+**What goes wrong without this:** You write `@Document(collection = "Order")` and Spring creates
+a brand-new empty collection named “Order”. The 45,000 documents in “orders” are invisible to
+your code. Queries return empty results with no error.
+
+-----
+
+## Tool 2: find
+
+**Definition:** Fetches real documents from a collection. This is the most important introspection
+tool because it shows the actual data shape — exact field names, actual types, real nesting depth,
+and which fields hold cross-collection references. A sample of 3 documents reveals more about the
+data model than any schema diagram could.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name",
+  "filter": {},
+  "projection": {},
+  "limit": 3,
+  "skip": 0,
+  "sort": { "createdAt": -1 }
+}
+```
+
+- `database`, `collection` (required)
+- `filter`: MongoDB query object. Use `{}` for any document.
+- `limit`: ALWAYS set to 3–5 for introspection. Never omit — you don’t want all documents.
+- `sort`: Use `{ "createdAt": -1 }` to get the most recent (and most likely complete) documents.
+
+**Example:**
+
+```
+Input:
+  find({ database: "bnp_trade_db", collection: "orders", filter: {}, limit: 3, sort: { "created_at": -1 } })
+
+Output:
+  [
+    {
+      "_id": "64abc123",
+      "user_id": "64xyz789",        ← snake_case! Java field needs @Field("user_id")
+      "order_status": "COMPLETED",  ← looks like an enum — run $group to get all values
+      "total_amount": 1500.00,
+      "line_items": [               ← embedded array — List<LineItem> in Java
+        { "product_id": "64p01", "qty": 2, "unit_price": 750.00 }
+      ],
+      "shipping_address": {         ← embedded object — ShippingAddress POJO in Java
+        "city": "Chennai", "pin": "600001"
+      },
+      "created_at": ISODate(...)    ← @Field("created_at") + @CreatedDate
+    }
+  ]
+```
+
+**Decode each field:**
+
+```
+"_id": "64abc123"               → @Id private String id;
+"user_id": "64xyz789"           → @Field("user_id") @Indexed private String userId;
+"order_status": "COMPLETED"     → @Field("order_status") private OrderStatus status;
+                                   Run aggregate $group to get all enum values
+"total_amount": 1500.00         → @Field("total_amount") private Double totalAmount;
+"line_items": [{ ... }]         → private List<LineItem> lineItems;
+                                   LineItem is an embedded POJO (no @Document)
+"shipping_address": { ... }     → private ShippingAddress shippingAddress;
+                                   ShippingAddress is an embedded POJO (no @Document)
+"created_at": ISODate(...)      → @Field("created_at") @CreatedDate private LocalDateTime createdAt;
+```
+
+**What goes wrong without this:** You write `private String userId` without `@Field("user_id")`.
+Spring Data queries for `"userId"` in MongoDB. The field doesn’t exist — it’s called `"user_id"`.
+Every query that filters on userId silently returns zero results.
+
+-----
+
+## Tool 3: aggregate
+
+**Definition:** Runs a MongoDB aggregation pipeline — a sequence of transformation stages applied
+to documents. Use it to confirm cross-collection relationships, discover all enum values, calculate
+grouped statistics, and validate that data model assumptions are correct before writing code.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "starting_collection",
+  "pipeline": [ { "$stage": { ... } } ]
+}
+```
+
+**Use Case A — Confirm a cross-collection relation ($lookup = SQL JOIN):**
+
+You see `"user_id": "64xyz789"` in orders. Before writing the join logic, confirm it actually
+resolves to a user document:
+
+```json
+{
+  "collection": "orders",
+  "pipeline": [
+    { "$limit": 2 },
+    { "$lookup": {
+        "from": "users",
+        "localField": "user_id",
+        "foreignField": "_id",
+        "as": "user_data"
+    }},
+    { "$project": { "user_id": 1, "user_data.name": 1, "user_data.email": 1 } }
+  ]
+}
+```
+
+- If `user_data` has content → relation confirmed, write service-layer join
+- If `user_data` is empty → field name mismatch or data integrity issue → warn user
+
+**Use Case B — Discover all enum values ($group):**
+
+You see `"order_status": "COMPLETED"` in one document. What are ALL the values?
+
+```json
+{
+  "collection": "orders",
+  "pipeline": [
+    { "$group": { "_id": "$order_status" } },
+    { "$sort":  { "_id": 1 } }
+  ]
+}
+```
+
+Result: `[{"_id":"CANCELLED"},{"_id":"COMPLETED"},{"_id":"PENDING"},{"_id":"SHIPPED"}]`
+
+Now you can write the correct, complete Java enum:
+
+```java
+public enum OrderStatus { PENDING, SHIPPED, COMPLETED, CANCELLED }
+```
+
+**Use Case C — Unwind embedded array + aggregate (validate embedded structure):**
+
+```json
+{
+  "collection": "orders",
+  "pipeline": [
+    { "$unwind": "$line_items" },
+    { "$group": {
+        "_id": "$line_items.product_id",
+        "total_qty": { "$sum": "$line_items.qty" }
+    }},
+    { "$limit": 5 }
+  ]
+}
+```
+
+This proves `line_items` is an embedded array and confirms the nested field names.
+
+-----
+
+## Tool 4: list_indexes
+
+**Definition:** Returns all indexes defined on a collection. Indexes are the most important
+performance signal in MongoDB. Every index tells you two things: which field is queried frequently
+enough to warrant an index, and what annotation belongs on that field in your Java entity.
+Missing an index annotation means Spring Data won’t create it (if auto-index-creation is true)
+or your code is out of sync with the DB (if auto-index-creation is false).
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name"
+}
+```
+
+**Example:**
+
+```
+Input:  list_indexes({ "database": "bnp_trade_db", "collection": "orders" })
+
+Output:
+  [
+    { "name": "_id_",           "key": { "_id": 1 } },
+    { "name": "user_id_1",      "key": { "user_id": 1 } },
+    { "name": "email_unique",   "key": { "email": 1 },  "unique": true },
+    { "name": "status_date_idx","key": { "order_status": 1, "created_at": -1 } },
+    { "name": "desc_text",      "key": { "description": "text" } },
+    { "name": "expires_ttl",    "key": { "expires_at": 1 }, "expireAfterSeconds": 86400 }
+  ]
+```
+
+**Decode each index into Java:**
+
+```
+_id_                                →  No annotation needed (automatic)
+
+user_id_1 (single, not unique)      →  @Indexed
+                                       @Field("user_id") private String userId;
+
+email_unique (unique: true)         →  @Indexed(unique = true)
+                                       private String email;
+
+status_date_idx (compound)          →  At CLASS level:
+                                       @CompoundIndex(
+                                         name = "status_date_idx",
+                                         def = "{'order_status':1, 'created_at':-1}"
+                                       )
+
+desc_text (text index)              →  @TextIndexed
+                                       private String description;
+
+expires_ttl (TTL, expireAfterSeconds)→  @Indexed(expireAfterSeconds = 86400)
+                                        @Field("expires_at") private LocalDateTime expiresAt;
+```
+
+**What goes wrong without this:** Your Java entity has no `@Indexed` on `userId`. If
+auto-index-creation is true, Spring doesn’t create the index. Every query by userId performs
+a COLLSCAN (full collection scan) — on 45,000 documents this takes 2–3 seconds instead of 5ms.
+
+-----
+
+## Tool 5: count_documents
+
+**Definition:** Counts documents matching a filter without loading any document content.
+It’s fast and costs almost nothing. Use it to determine data volume, which directly decides
+whether repository methods need `Pageable` parameters.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name",
+  "filter": {}
+}
+```
+
+**Examples:**
+
+```
+count_documents({ database: "bnp_trade_db", collection: "orders", filter: {} })
+→ 45231
+
+count_documents({ database: "bnp_trade_db", collection: "orders", filter: { "order_status": "PENDING" } })
+→ 312
+```
+
+**What to do with the result:**
+
+```
+< 1,000     → List<T> return is fine
+1K – 10K    → Add Pageable, warn user data will grow
+> 10,000    → MANDATORY: ALL repo methods must use Pageable — never return List<T>
+> 1,000,000 → Pageable + cursor-based pagination + never call findAll()
+```
+
+**What goes wrong without this:** You write `List<Order> findByUserId(String userId)`. The
+collection has 200,000 documents. One user has 3,000 orders. The call loads all 3,000 into heap.
+Under load, this causes OOM errors or forces a GC pause that blocks the entire service thread.
+
+-----
+
+## Tool 6: get_collection_schema
+
+**Definition:** Returns schema validation rules defined on a collection. Not all MongoDB instances
+use schema validation, but when present it tells you which fields are required (should not be
+`Optional<>` in Java), their expected types, and any constraints. Use as a supplementary call
+after `find` — schema validation is the formal contract, sampled documents are the reality.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name"
+}
+```
+
+**What you learn:**
+
+```
+Required fields       →  Make these non-null in Java (don't use Optional<>)
+Type constraints      →  Confirms the Java type (String vs Integer vs Double)
+Enum constraints      →  Alternative to $group for discovering valid enum values
+Minimum/maximum rules →  Add @Min/@Max validation annotations to match
+```
+
+-----
+
+## Tool 7: insert_one
+
+**Definition:** Inserts a single document into a collection. Use ONLY when the user explicitly
+asks to create test data or seed a document. Never call during schema analysis.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name",
+  "document": { "field": "value" }
+}
+```
+
+**Safety rule:** Always show the document to the user before inserting. Confirm the collection name.
+
+-----
+
+## Tool 8: update_one / update_many
+
+**Definition:** `update_one` modifies the first document matching a filter. `update_many` modifies
+all matching documents. These are destructive — they change live data.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name",
+  "filter": { "order_status": "PENDING" },
+  "update": { "$set": { "order_status": "CANCELLED" } }
+}
+```
+
+**Safety rule:** Always show the filter and the update operation to the user and wait for explicit
+confirmation before calling. Run count_documents with the same filter first to show how many
+documents will be affected.
+
+-----
+
+## Tool 9: delete_one / delete_many
+
+**Definition:** `delete_one` permanently removes the first matching document. `delete_many`
+removes all matching documents. These are irreversible.
+
+**Safety rule:** NEVER call without explicit written confirmation from the user. Before asking,
+run count_documents with the same filter and show the user exactly how many documents will be
+deleted. State that this cannot be undone.
+
+-----
+
+## Tool 10: create_index
+
+**Definition:** Creates a new index on a collection directly in the running MongoDB instance.
+Use this when recommending performance improvements alongside the code changes — create the index
+in the DB and add the annotation in Java at the same time so they stay in sync.
+
+**Parameters:**
+
+```json
+{
+  "database": "your_db_name",
+  "collection": "collection_name",
+  "keys": { "user_id": 1, "created_at": -1 },
+  "options": { "name": "user_created_idx", "unique": false }
+}
+```
+
+**Index direction:** `1` = ascending, `-1` = descending. Match direction to the most common
+sort direction — a query that sorts `created_at DESC` benefits from a `-1` index.
+
+-----
+
+## Recommended Call Order
+
+For every feature implementation or code generation task, call in this order:
+
+```
+1. list_collections(db)
+   → Know exact collection names before writing @Document
+
+2. find(db, collection, {}, limit=3, sort={created_at:-1})  ← for each relevant collection
+   → Ground truth: real field names, types, nesting
+
+3. list_indexes(db, collection)  ← for each relevant collection
+   → Know which fields need @Indexed, @Indexed(unique), @CompoundIndex
+
+4. count_documents(db, collection, {})  ← for each relevant collection
+   → Decide on Pageable requirement
+
+5. aggregate($lookup)  ← only if cross-collection relation suspected
+   → Confirm the join works before writing service-layer join code
+
+6. aggregate($group on string/enum fields)  ← for status/type/category fields
+   → Get every real distinct value to define Java enum correctly
+```
+
+-----
+
+## MCP Result → Java Annotation Map
+
+|MCP finding                          |Java code                                                      |
+|-------------------------------------|---------------------------------------------------------------|
+|Collection name `"orders"`           |`@Document(collection = "orders")`                             |
+|Field `"user_id"` in document        |`@Field("user_id") private String userId;`                     |
+|Single index on `user_id`            |`@Indexed` on the `userId` field                               |
+|Unique index on `email`              |`@Indexed(unique = true) private String email;`                |
+|Compound index `{status,created_at}` |`@CompoundIndex(def = "{'order_status':1,'created_at':-1}")`   |
+|TTL index `expireAfterSeconds: 86400`|`@Indexed(expireAfterSeconds = 86400)`                         |
+|Text index on `description`          |`@TextIndexed private String description;`                     |
+|Nested object `"address": {...}`     |`private ShippingAddress shippingAddress;` (POJO, no @Document)|
+|Array of objects `"items": [{...}]`  |`private List<LineItem> lineItems;` (POJO list, no @Document)  |
+|String ID ref `"user_id": "64abc..."`|`private String userId;` + join in service                     |
+|$group result: PENDING/SHIPPED/DONE  |`enum Status { PENDING, SHIPPED, DONE }`                       |
+|count > 10,000                       |Add `Pageable pageable` to all repo methods                    |
