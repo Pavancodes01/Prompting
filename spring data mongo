@@ -1,0 +1,739 @@
+# Spring Data MongoDB — Code Patterns, Performance & Common Issues
+
+## Table of Contents
+
+1. [Entity Class](#1-entity-class)
+1. [Embedded Documents](#2-embedded-documents)
+1. [Manual References](#3-manual-references)
+1. [Repository Interface](#4-repository-interface)
+1. [MongoTemplate — Dynamic Queries](#5-mongotemplate--dynamic-queries)
+1. [Aggregation Pipelines](#6-aggregation-pipelines)
+1. [Index Annotations](#7-index-annotations)
+1. [Pagination](#8-pagination)
+1. [Enums](#9-enums)
+1. [Auditing](#10-auditing)
+1. [MongoConfig](#11-mongoconfig)
+1. [Making Queries Fast](#12-making-queries-fast)
+1. [Common Issues and Fixes](#13-common-issues-and-fixes)
+
+-----
+
+## 1. Entity Class
+
+The main Java class that maps to a MongoDB collection. Every decision here — collection name,
+field mapping, indexes — must come from what `find` and `list_indexes` MCP calls revealed.
+
+```java
+package com.example.domain;
+
+import lombok.Builder;
+import lombok.Data;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
+import org.springframework.data.mongodb.core.index.CompoundIndexes;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.mapping.Field;
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Data
+@Builder
+@Document(collection = "orders")           // exact name from list_collections
+@CompoundIndexes({                         // compound indexes from list_indexes at class level
+    @CompoundIndex(name = "status_date_idx", def = "{'order_status':1, 'created_at':-1}"),
+    @CompoundIndex(name = "user_status_idx", def = "{'user_id':1, 'order_status':1}")
+})
+public class Order {
+
+    @Id
+    private String id;                     // always String — Spring handles ObjectId conversion
+
+    @Field("user_id")                      // DB uses snake_case — @Field bridges to camelCase
+    @Indexed                               // single index from list_indexes
+    private String userId;
+
+    @Field("order_status")
+    private OrderStatus status;            // enum — stored as String in MongoDB
+
+    @Field("total_amount")
+    private Double totalAmount;
+
+    private String currency;               // field name matches Java — no @Field needed
+
+    @Field("line_items")
+    private List<LineItem> lineItems;      // embedded array
+
+    @Field("shipping_address")
+    private ShippingAddress shippingAddress; // embedded object
+
+    @Field("created_at")
+    @CreatedDate                           // auto-set on insert (needs @EnableMongoAuditing)
+    private LocalDateTime createdAt;
+
+    @Field("updated_at")
+    @LastModifiedDate                      // auto-updated on every save
+    private LocalDateTime updatedAt;
+
+    @Field("expires_at")
+    @Indexed(expireAfterSeconds = 604800)  // TTL index — auto-delete after 7 days
+    private LocalDateTime expiresAt;
+}
+```
+
+-----
+
+## 2. Embedded Documents
+
+Embedded documents are POJOs nested inside a parent document. They do NOT get `@Document` —
+that annotation registers a class as a top-level collection. Embedded classes are just Java objects.
+
+```java
+// LineItem lives inside Order.lineItems — no @Document
+@Data
+@Builder
+public class LineItem {
+    @Field("product_id")
+    private String productId;
+
+    private Integer qty;
+
+    @Field("unit_price")
+    private Double unitPrice;
+
+    @Field("product_name")              // denormalized snapshot — intentional in MongoDB
+    private String productName;
+}
+
+// ShippingAddress lives inside Order.shippingAddress — no @Document
+@Data
+@Builder
+public class ShippingAddress {
+    private String street;
+    private String city;
+    private String state;
+    @Field("pin_code")
+    private String pinCode;
+    private String country;
+}
+```
+
+**When to embed vs when to reference:**
+
+- Embed: child is always fetched with parent, has no independent lifecycle, list is bounded
+- Reference: child is updated independently, shared across many parents, list can grow without bound
+
+-----
+
+## 3. Manual References
+
+Store the foreign ID as a String. Join in the service layer. Never use `@DBRef`.
+
+`@DBRef` fires one DB query per document (N+1), is deprecated in Spring Data MongoDB 4.x,
+and doesn’t work across Atlas clusters. Manual references + batch loading is always better.
+
+```java
+// Entity: store just the ID
+@Document(collection = "orders")
+public class Order {
+    @Id private String id;
+    @Indexed
+    @Field("user_id")
+    private String userId;               // just the ID — full User loaded in service
+}
+
+// Service: single-document join
+public OrderDetailDto getOrderDetail(String orderId) {
+    Order order = orderRepository.findById(orderId)
+        .orElseThrow(() -> new EntityNotFoundException("Order not found: " + orderId));
+    User user = userRepository.findById(order.getUserId())
+        .orElseThrow(() -> new EntityNotFoundException("User not found: " + order.getUserId()));
+    return OrderDetailDto.from(order, user);
+}
+
+// Service: batch join — avoid N+1 for lists
+public List<OrderDetailDto> getOrdersWithUsers(List<Order> orders) {
+    Set<String> userIds = orders.stream().map(Order::getUserId).collect(Collectors.toSet());
+    Map<String, User> userMap = userRepository.findAllById(userIds)
+        .stream().collect(Collectors.toMap(User::getId, u -> u));
+    return orders.stream()
+        .map(o -> OrderDetailDto.from(o, userMap.get(o.getUserId())))
+        .collect(Collectors.toList());
+}
+```
+
+-----
+
+## 4. Repository Interface
+
+```java
+@Repository
+public interface OrderRepository extends MongoRepository<Order, String> {
+
+    // Spring generates queries from method names automatically
+
+    Page<Order> findByUserId(String userId, Pageable pageable);
+    Page<Order> findByStatus(OrderStatus status, Pageable pageable);
+    Page<Order> findByUserIdAndStatus(String userId, OrderStatus status, Pageable pageable);
+
+    List<Order> findByStatusIn(List<OrderStatus> statuses);
+
+    Page<Order> findByCreatedAtBetween(LocalDateTime from, LocalDateTime to, Pageable pageable);
+
+    boolean existsByUserIdAndStatus(String userId, OrderStatus status);
+    long countByStatus(OrderStatus status);
+
+    // @Query for cases where method names become unreadable
+    @Query("{ 'user_id': ?0, 'order_status': { $in: ?1 }, 'total_amount': { $gte: ?2 } }")
+    Page<Order> findByUserAndStatusesAndMinAmount(
+        String userId, List<OrderStatus> statuses, Double minAmount, Pageable pageable);
+
+    // Projection — fetch only the fields you need (faster, less heap)
+    @Query(value = "{ 'order_status': ?0 }",
+           fields = "{ 'order_status': 1, 'total_amount': 1, 'created_at': 1 }")
+    List<Order> findSummariesByStatus(OrderStatus status);
+
+    // Slice — no count query (faster than Page for infinite scroll / load more)
+    Slice<Order> findByUserId(String userId, Pageable pageable);
+
+    void deleteByStatusAndCreatedAtBefore(OrderStatus status, LocalDateTime before);
+}
+```
+
+-----
+
+## 5. MongoTemplate — Dynamic Queries
+
+Use MongoTemplate when filters are dynamic (the user may or may not provide certain parameters)
+or when method names would be too long. The Criteria API is type-safe and avoids raw string bugs.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class OrderQueryService {
+
+    private final MongoTemplate mongoTemplate;
+
+    // Dynamic search — repo method names can't handle optional parameters cleanly
+    public Page<Order> searchOrders(String userId, OrderStatus status,
+                                    LocalDateTime from, LocalDateTime to, Pageable pageable) {
+        Criteria criteria = new Criteria();
+        if (StringUtils.hasText(userId))    criteria = criteria.and("user_id").is(userId);
+        if (status != null)                  criteria = criteria.and("order_status").is(status);
+        if (from != null && to != null)      criteria = criteria.and("created_at").gte(from).lte(to);
+
+        Query query = new Query(criteria);
+        long total = mongoTemplate.count(query, Order.class);  // count BEFORE adding limit
+        query.with(pageable);
+        return new PageImpl<>(mongoTemplate.find(query, Order.class), pageable, total);
+    }
+
+    // Partial update — avoids loading the full document into heap
+    public void markShipped(String orderId, String trackingNumber) {
+        Query q = new Query(Criteria.where("_id").is(orderId));
+        Update u = new Update()
+            .set("order_status", OrderStatus.SHIPPED)
+            .set("tracking_number", trackingNumber)
+            .set("updated_at", LocalDateTime.now());
+        mongoTemplate.updateFirst(q, u, Order.class);
+    }
+
+    // Atomic increment (e.g. retry counter)
+    public void incrementRetryCount(String orderId) {
+        mongoTemplate.updateFirst(
+            new Query(Criteria.where("_id").is(orderId)),
+            new Update().inc("retry_count", 1),
+            Order.class
+        );
+    }
+
+    // Push to embedded array without loading the document
+    public void addLineItem(String orderId, LineItem item) {
+        mongoTemplate.updateFirst(
+            new Query(Criteria.where("_id").is(orderId)),
+            new Update().push("line_items", item),
+            Order.class
+        );
+    }
+
+    // Upsert — create if not exists, update if exists
+    public void upsertPreference(String userId, String key, String value) {
+        mongoTemplate.upsert(
+            new Query(Criteria.where("user_id").is(userId)),
+            new Update().set("preferences." + key, value).setOnInsert("user_id", userId),
+            UserPreference.class
+        );
+    }
+}
+```
+
+-----
+
+## 6. Aggregation Pipelines
+
+Use `MongoTemplate.aggregate()` for grouped reports and cross-collection analytics.
+
+```java
+// Revenue report: orders joined with users, grouped by user, sorted by spend
+public List<UserRevenueSummary> getUserRevenueSummary(LocalDateTime from, LocalDateTime to) {
+    Aggregation agg = Aggregation.newAggregation(
+        Aggregation.match(
+            Criteria.where("order_status").is("COMPLETED")
+                    .and("created_at").gte(from).lte(to)
+        ),
+        Aggregation.group("user_id")
+            .count().as("orderCount")
+            .sum("total_amount").as("totalRevenue"),
+        Aggregation.lookup("users", "_id", "_id", "userDetails"),
+        Aggregation.unwind("userDetails"),        // $lookup returns array — flatten it
+        Aggregation.project()
+            .and("userDetails.name").as("userName")
+            .and("userDetails.email").as("userEmail")
+            .andInclude("orderCount", "totalRevenue"),
+        Aggregation.sort(Sort.by(Sort.Direction.DESC, "totalRevenue")),
+        Aggregation.limit(20)
+    );
+    return mongoTemplate.aggregate(agg, "orders", UserRevenueSummary.class).getMappedResults();
+}
+
+// Top products: unwind embedded array, then group
+public List<ProductSalesSummary> getTopProducts(int topN) {
+    Aggregation agg = Aggregation.newAggregation(
+        Aggregation.match(Criteria.where("order_status").is("COMPLETED")),
+        Aggregation.unwind("line_items"),
+        Aggregation.group("line_items.product_id")
+            .sum("line_items.qty").as("totalQty")
+            .sum(ArithmeticOperators.Multiply
+                .valueOf("line_items.qty").multiplyBy("line_items.unit_price")
+            ).as("totalRevenue"),
+        Aggregation.sort(Sort.by(Sort.Direction.DESC, "totalRevenue")),
+        Aggregation.limit(topN)
+    );
+    return mongoTemplate.aggregate(agg, "orders", ProductSalesSummary.class).getMappedResults();
+}
+
+// DTOs for aggregation results
+public record UserRevenueSummary(String userName, String userEmail,
+                                  Long orderCount, Double totalRevenue) {}
+public record ProductSalesSummary(String id, Long totalQty, Double totalRevenue) {}
+```
+
+-----
+
+## 7. Index Annotations
+
+```java
+@Indexed                                       // single-field index
+@Indexed(unique = true)                        // unique constraint
+@Indexed(expireAfterSeconds = 86400)           // TTL — auto-delete after 24h
+@TextIndexed                                   // full-text search
+@TextIndexed(weight = 2)                       // higher relevance in text search
+
+// Compound indexes — always at class level
+@CompoundIndex(name = "status_date", def = "{'order_status':1,'created_at':-1}")
+
+// Multiple compound indexes
+@CompoundIndexes({
+    @CompoundIndex(name = "status_date", def = "{'order_status':1,'created_at':-1}"),
+    @CompoundIndex(name = "user_status", def = "{'user_id':1,'order_status':1}")
+})
+```
+
+-----
+
+## 8. Pagination
+
+```java
+// Service — return Page<DTO> not Page<Entity>
+public Page<OrderSummaryDto> getOrdersByStatus(String status, int page, int size) {
+    Pageable pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "created_at"));
+    return orderRepository.findByStatus(OrderStatus.valueOf(status), pageable)
+                          .map(OrderSummaryDto::from);
+}
+
+// Controller
+@GetMapping("/orders")
+public ResponseEntity<Page<OrderSummaryDto>> getOrders(
+    @RequestParam String status,
+    @RequestParam(defaultValue = "0") int page,
+    @RequestParam(defaultValue = "20") int size) {
+    return ResponseEntity.ok(orderService.getOrdersByStatus(status, page, size));
+}
+```
+
+-----
+
+## 9. Enums
+
+```java
+// Values from aggregate $group call
+public enum OrderStatus { PENDING, CONFIRMED, SHIPPED, DELIVERED, COMPLETED, CANCELLED }
+
+// In entity — Spring Data stores as String automatically
+@Field("order_status")
+private OrderStatus status;
+
+// In repository — pass enum directly (Spring converts automatically)
+Page<Order> findByStatus(OrderStatus status, Pageable pageable);
+Page<Order> findByStatusIn(List<OrderStatus> statuses, Pageable pageable);
+```
+
+-----
+
+## 10. Auditing
+
+```java
+// Step 1: Enable in MongoConfig
+@Configuration
+@EnableMongoAuditing    // ← this one annotation makes @CreatedDate and @LastModifiedDate work
+public class MongoConfig { }
+
+// Step 2: Add to entity
+@CreatedDate
+@Field("created_at")
+private LocalDateTime createdAt;
+
+@LastModifiedDate
+@Field("updated_at")
+private LocalDateTime updatedAt;
+
+// Step 3 (optional): Track who made changes
+@Bean
+public AuditorAware<String> auditorProvider() {
+    return () -> Optional.ofNullable(SecurityContextHolder.getContext().getAuthentication())
+                         .map(Authentication::getName);
+}
+```
+
+-----
+
+## 11. MongoConfig
+
+```java
+@Configuration
+@EnableMongoAuditing
+@EnableMongoRepositories(basePackages = "com.example.repository")
+public class MongoConfig {
+
+    @Bean
+    public MongoTemplate mongoTemplate(MongoDatabaseFactory factory,
+                                       MappingMongoConverter converter) {
+        MongoTemplate template = new MongoTemplate(factory, converter);
+        template.setWriteConcern(WriteConcern.MAJORITY);  // data durability in production
+        return template;
+    }
+
+    // Register custom converters if MongoDB stores data in a non-standard format
+    @Bean
+    public MongoCustomConversions customConversions() {
+        return new MongoCustomConversions(List.of(
+            // add converter instances here
+        ));
+    }
+}
+```
+
+application.yml:
+
+```yaml
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/your_db_name
+      auto-index-creation: true   # ONLY in dev. Set false before any prod deployment.
+```
+
+-----
+
+## 12. Making Queries Fast
+
+-----
+
+### Problem: Full Collection Scan (COLLSCAN)
+
+**Why it’s slow:** Without an index, MongoDB reads every document to find matches.
+On 100K documents this takes 2–5 seconds. With an index it takes 1–5ms.
+
+**How to detect:** Query is slow and `list_indexes` shows no index on the filtered field.
+
+**Fix:**
+
+```java
+// Query: findByUserId — add index on user_id
+@Indexed
+@Field("user_id")
+private String userId;
+
+// Query: findByStatusAndCreatedAt — compound index must include both fields, in query order
+@CompoundIndex(def = "{'order_status':1, 'created_at':-1}")
+// Rule: the order of fields in the compound index must match the order in your query/sort
+```
+
+-----
+
+### Problem: N+1 Queries
+
+**Why it’s slow:** Loading 100 orders then calling `findById(userId)` for each = 101 DB round trips.
+
+**Fix — batch load:**
+
+```java
+// BAD: N+1
+orders.forEach(o -> {
+    User user = userRepository.findById(o.getUserId()).get();  // 1 query per order
+});
+
+// GOOD: 2 queries total
+Set<String> userIds = orders.stream().map(Order::getUserId).collect(Collectors.toSet());
+Map<String, User> userMap = userRepository.findAllById(userIds)
+    .stream().collect(Collectors.toMap(User::getId, u -> u));
+orders.forEach(o -> process(o, userMap.get(o.getUserId())));
+```
+
+-----
+
+### Problem: Fetching Too Many Fields
+
+**Why it’s slow:** Loading 50 fields when you display 3. Extra data travels the network
+and occupies heap for no reason.
+
+**Fix — use projection:**
+
+```java
+// Fetch only the 3 fields you need
+@Query(value = "{ 'order_status': ?0 }",
+       fields = "{ 'order_status': 1, 'total_amount': 1, 'created_at': 1 }")
+List<Order> findSummariesByStatus(OrderStatus status);
+
+// Interface projection (Spring generates it)
+public interface OrderSummary {
+    String getId();
+    String getOrderStatus();
+    Double getTotalAmount();
+}
+List<OrderSummary> findByStatus(OrderStatus status);
+```
+
+-----
+
+### Problem: findAll() on Large Collection
+
+**Why it’s slow / dangerous:** Loads every document into heap. On 5M documents this causes OOM.
+
+**Fix:**
+
+```java
+// NEVER
+List<Order> all = orderRepository.findAll();
+
+// ALWAYS paginate
+Page<Order> page = orderRepository.findAll(PageRequest.of(0, 100));
+// or filter first
+Page<Order> pending = orderRepository.findByStatus(OrderStatus.PENDING, PageRequest.of(0, 50));
+```
+
+-----
+
+### Problem: Sorting on Unindexed Field
+
+**Why it’s slow:** MongoDB must load all matching documents into RAM and sort them there.
+With large result sets this hits the 32MB in-memory sort limit and the query fails.
+
+**Fix — sort field must be in the index:**
+
+```java
+// Query: find by status, sort by created_at DESC
+// Index must include both fields, in the direction you sort
+@CompoundIndex(def = "{'order_status':1, 'created_at':-1}")
+// -1 in index = DESC sort is efficient. +1 for both = ASC sort efficient.
+```
+
+-----
+
+### Problem: Querying Embedded Array Fields Without a Multikey Index
+
+**Why it’s slow:** Querying `line_items.product_id` without an index = full scan.
+
+**Fix — create multikey index via MongoConfig or MCP:**
+
+```java
+// In MongoConfig (programmatic index creation)
+@Bean
+public InitializingBean initIndexes(MongoTemplate mongoTemplate) {
+    return () -> {
+        mongoTemplate.indexOps("orders")
+            .ensureIndex(new Index("line_items.product_id", Sort.Direction.ASC)
+                .named("lineitems_productid_idx"));
+    };
+}
+
+// Or use MCP create_index tool:
+// create_index({ keys: {"line_items.product_id": 1}, options: {name: "lineitems_productid_idx"} })
+// MongoDB automatically makes this a multikey index because the path traverses an array
+```
+
+-----
+
+### Performance Decision Checklist
+
+Before submitting any repository method, verify:
+
+```
+[ ] Every field in the WHERE clause has an index?             (from list_indexes)
+[ ] Sort field is included in the index, with matching direction?
+[ ] Result set can be large?                                  → add Pageable
+[ ] Fetching fields you don't use in the response?           → add projection
+[ ] Calling findById in a loop?                               → batch with findAllById + Map
+[ ] Using findAll on a collection with > 10K docs?            → add filter + Pageable
+[ ] auto-index-creation=true in a non-dev profile?           → flag it
+```
+
+-----
+
+## 13. Common Issues and Fixes
+
+-----
+
+### Issue 1: Query returns empty — wrong collection name
+
+**Symptom:** Query runs without error but always returns `[]`.
+**Cause:** `@Document(collection = "Order")` when real collection is `"orders"`.
+Spring Data silently creates a new empty collection named “Order”.
+**Fix:**
+
+```java
+// BEFORE:  @Document(collection = "Order")   // wrong — 0 documents
+// AFTER:   @Document(collection = "orders")  // from list_collections MCP
+```
+
+-----
+
+### Issue 2: Field always null in Java
+
+**Symptom:** `order.getUserId()` returns `null` even though MongoDB documents have `user_id`.
+**Cause:** Missing `@Field("user_id")`. Spring looks for a field named `"userId"` — not found.
+**Fix:**
+
+```java
+// BEFORE:  private String userId;              // Spring looks for "userId" — missing
+// AFTER:   @Field("user_id") private String userId;  // mapped from "user_id"
+```
+
+-----
+
+### Issue 3: N+1 from @DBRef
+
+**Symptom:** Loading 100 orders causes 101 MongoDB queries. Thread profiler shows a query loop.
+**Cause:** `@DBRef private User user;` fires one extra query per document automatically.
+**Fix:** Remove `@DBRef`. Store `private String userId;`. Load in service with batch strategy.
+
+-----
+
+### Issue 4: Enum deserialization fails
+
+**Symptom:** `No enum constant OrderStatus.completed` on read. Or queries by enum return nothing.
+**Cause:** MongoDB stores `"completed"` (lowercase) but Java enum is `COMPLETED`.
+**Fix — custom converter:**
+
+```java
+@ReadingConverter
+public class StringToOrderStatusConverter implements Converter<String, OrderStatus> {
+    public OrderStatus convert(String s) { return OrderStatus.valueOf(s.toUpperCase()); }
+}
+@WritingConverter
+public class OrderStatusToStringConverter implements Converter<OrderStatus, String> {
+    public String convert(OrderStatus s) { return s.name().toLowerCase(); }
+}
+// Register both in MongoConfig.customConversions()
+```
+
+-----
+
+### Issue 5: @CreatedDate is always null
+
+**Symptom:** Entity saves successfully but `createdAt` is always `null`.
+**Cause:** `@EnableMongoAuditing` is missing from the config class.
+**Fix:** Add `@EnableMongoAuditing` to your `MongoConfig` (or any `@Configuration` class).
+
+-----
+
+### Issue 6: Aggregation result DTO is all nulls
+
+**Symptom:** Aggregation runs without error but every field in the result object is `null`.
+**Cause:** Aggregation output field names don’t match DTO field names.
+**Fix:**
+
+```java
+// Aggregation outputs: { "totalRevenue": 1500.0, "orderCount": 5 }
+// DTO field names MUST match exactly:
+public record UserRevenueSummary(Long orderCount, Double totalRevenue) {}
+// If names differ, rename with .as() in the project stage:
+Aggregation.project().and("total_revenue").as("totalRevenue")
+```
+
+-----
+
+### Issue 7: Duplicate key error on startup
+
+**Symptom:** App fails to start with `MongoWriteException: duplicate key error`.
+**Cause:** `auto-index-creation=true` + you added `@Indexed(unique=true)` to a field that already
+has duplicate values in the DB.
+**Fix:**
+
+```
+1. Find duplicates:  aggregate $group by the field, $match count > 1
+2. Remove or merge duplicates
+3. Drop the old non-unique index via MongoDB Compass or create_index MCP
+4. Restart — Spring will create the new unique index on clean data
+5. Set auto-index-creation=false before production deployment
+```
+
+-----
+
+### Issue 8: findById returns empty — ObjectId vs String mismatch
+
+**Symptom:** `findById("64abc123")` returns `Optional.empty()` but document exists.
+**Cause:** `@Id` field is `ObjectId` type but you’re passing a plain `String`.
+**Fix:**
+
+```java
+// Recommended: always use String for @Id
+@Id private String id;  // Spring handles String <-> ObjectId conversion automatically
+
+// If you must use ObjectId:
+@Id private ObjectId id;
+// Then call: repository.findById(new ObjectId("64abc123"))
+```
+
+-----
+
+### Troubleshooting Decision Tree
+
+```
+Query returns empty
+  → Check collection name: run list_collections, compare to @Document(collection=...)
+  → Check field name: run find (sample doc), compare to @Field annotations
+  → Check filter value case: "PENDING" vs "pending"
+
+Query is slow (> 200ms)
+  → Run list_indexes — is the queried field in an index?
+  → Is the sort field in the index with matching direction?
+  → Add @Indexed or @CompoundIndex + create_index MCP
+
+Field is null in Java
+  → Run find — what is the exact field name in MongoDB?
+  → Add @Field("exact_db_name") to the Java field
+
+Startup fails with duplicate key error
+  → auto-index-creation=true changed index to unique
+  → Find and remove duplicate values first, then restart
+
+@CreatedDate is null
+  → Add @EnableMongoAuditing to MongoConfig
+
+Aggregation result DTO all nulls
+  → Aggregation field names must exactly match DTO field names
+  → Use .as("javaFieldName") in project stage to rename
+```
